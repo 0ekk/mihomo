@@ -227,7 +227,8 @@ func dialStreamOne(ctx context.Context, cancel context.CancelFunc, ep *endpoint)
 }
 
 func dialStreamUp(ctx context.Context, cancel context.CancelFunc, uploadEP, downloadEP *endpoint) (net.Conn, error) {
-	downloadReq, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadEP.url.String(), nil)
+	downloadCtx := context.WithoutCancel(ctx)
+	downloadReq, err := http.NewRequestWithContext(downloadCtx, http.MethodGet, downloadEP.url.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +280,8 @@ func dialStreamUp(ctx context.Context, cancel context.CancelFunc, uploadEP, down
 }
 
 func dialPacketUp(ctx context.Context, cancel context.CancelFunc, uploadEP, downloadEP *endpoint) (net.Conn, error) {
-	downloadReq, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadEP.url.String(), nil)
+	downloadCtx := context.WithoutCancel(ctx)
+	downloadReq, err := http.NewRequestWithContext(downloadCtx, http.MethodGet, downloadEP.url.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -338,14 +340,15 @@ func handleUploads(ctx context.Context, ep *endpoint, reader *io.PipeReader) {
 			if ep.cfg.NoGRPCHeader {
 				req.Header.Del("Content-Type")
 			}
-			if resp, reqErr := ep.client.Do(req); reqErr != nil {
+			resp, reqErr := ep.client.Do(req)
+			if reqErr != nil {
 				reader.CloseWithError(reqErr)
 				return
-			} else {
-				io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
 			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
 			seq++
+
 			if interval > 0 {
 				select {
 				case <-time.After(interval):
