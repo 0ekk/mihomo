@@ -324,6 +324,11 @@ func (v *Vless) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
 	}
 	cfg.EnsureHTTP3TLS(hostHeader, v.option.SkipCertVerify, httpVersion)
 
+	clientFingerprint := v.option.ClientFingerprint
+	if cfg.ClientFingerprint != "" {
+		clientFingerprint = cfg.ClientFingerprint
+	}
+
 	dialFn := func(ctx context.Context, network string) (net.Conn, error) {
 		if network == "" {
 			network = "tcp"
@@ -335,10 +340,31 @@ func (v *Vless) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
 		if network != "tcp" {
 			return conn, nil
 		}
-		conn, err = v.streamTLSConn(ctx, conn, httpVersion == "2")
-		if err != nil {
-			_ = conn.Close()
-			return nil, err
+
+		if scheme == "https" || v.realityConfig != nil {
+			host, _, _ := net.SplitHostPort(v.addr)
+			tlsOpts := vmess.TLSConfig{
+				Host:              host,
+				SkipCertVerify:    v.option.SkipCertVerify,
+				FingerPrint:       v.option.Fingerprint,
+				Certificate:       v.option.Certificate,
+				PrivateKey:        v.option.PrivateKey,
+				ClientFingerprint: clientFingerprint,
+				ECH:               v.echConfig,
+				Reality:           v.realityConfig,
+				NextProtos:        v.option.ALPN,
+			}
+			if httpVersion == "2" {
+				tlsOpts.NextProtos = []string{"h2"}
+			}
+			if v.option.ServerName != "" {
+				tlsOpts.Host = v.option.ServerName
+			}
+			conn, err = vmess.StreamTLSConn(ctx, conn, &tlsOpts)
+			if err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
 		}
 		return conn, nil
 	}

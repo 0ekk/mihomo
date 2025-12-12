@@ -25,6 +25,7 @@ type Config struct {
 	ScStreamUpServerSecs Range             `proxy:"sc-stream-up-server-secs" json:"sc-stream-up-server-secs"`
 	Xmux                 *XmuxConfig       `proxy:"xmux" json:"xmux"`
 	Download             *Config           `proxy:"download-settings" json:"download-settings"`
+	ClientFingerprint    string            `proxy:"client-fingerprint" json:"client-fingerprint"`
 
 	internalTLS *tls.Config `json:"-"`
 }

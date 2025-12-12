@@ -445,6 +445,11 @@ func (v *Vmess) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
 	}
 	cfg.EnsureHTTP3TLS(hostHeader, v.option.SkipCertVerify, httpVersion)
 
+	clientFingerprint := v.option.ClientFingerprint
+	if cfg.ClientFingerprint != "" {
+		clientFingerprint = cfg.ClientFingerprint
+	}
+
 	dialFn := func(ctx context.Context, network string) (net.Conn, error) {
 		if network == "" {
 			network = "tcp"
@@ -472,7 +477,7 @@ func (v *Vmess) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
 				FingerPrint:       v.option.Fingerprint,
 				Certificate:       v.option.Certificate,
 				PrivateKey:        v.option.PrivateKey,
-				ClientFingerprint: v.option.ClientFingerprint,
+				ClientFingerprint: clientFingerprint,
 				ECH:               v.echConfig,
 				Reality:           v.realityConfig,
 				NextProtos:        []string{"h2"},

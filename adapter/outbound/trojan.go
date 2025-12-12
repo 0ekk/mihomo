@@ -310,6 +310,11 @@ func (t *Trojan) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
 	}
 	cfg.EnsureHTTP3TLS(hostHeader, t.option.SkipCertVerify, httpVersion)
 
+	clientFingerprint := t.option.ClientFingerprint
+	if cfg.ClientFingerprint != "" {
+		clientFingerprint = cfg.ClientFingerprint
+	}
+
 	dialFn := func(ctx context.Context, network string) (net.Conn, error) {
 		if network == "" {
 			network = "tcp"
@@ -336,7 +341,7 @@ func (t *Trojan) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
 			FingerPrint:       t.option.Fingerprint,
 			Certificate:       t.option.Certificate,
 			PrivateKey:        t.option.PrivateKey,
-			ClientFingerprint: t.option.ClientFingerprint,
+			ClientFingerprint: clientFingerprint,
 			ECH:               t.echConfig,
 			Reality:           t.realityConfig,
 			NextProtos:        alpn,
