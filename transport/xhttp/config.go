@@ -12,22 +12,23 @@ import (
 
 // Config holds SplitHTTP client settings.
 type Config struct {
-	Host                 string            `proxy:"host" json:"host"`
-	Path                 string            `proxy:"path" json:"path"`
-	Mode                 string            `proxy:"mode" json:"mode"`
-	Headers              map[string]string `proxy:"headers" json:"headers"`
-	NoGRPCHeader         bool              `proxy:"no-grpc-header" json:"no-grpc-header"`
-	NoSSEHeader          bool              `proxy:"no-sse-header" json:"no-sse-header"`
-	XPaddingBytes        Range             `proxy:"x-padding-bytes" json:"x-padding-bytes"`
-	ScMaxEachPostBytes   Range             `proxy:"sc-max-each-post-bytes" json:"sc-max-each-post-bytes"`
-	ScMinPostsIntervalMs Range             `proxy:"sc-min-posts-interval-ms" json:"sc-min-posts-interval-ms"`
-	ScMaxBufferedPosts   Range             `proxy:"sc-max-buffered-posts" json:"sc-max-buffered-posts"`
-	ScStreamUpServerSecs Range             `proxy:"sc-stream-up-server-secs" json:"sc-stream-up-server-secs"`
-	Xmux                 *XmuxConfig       `proxy:"xmux" json:"xmux"`
-	Download             *Config           `proxy:"download-settings" json:"download-settings"`
-	ClientFingerprint    string            `proxy:"client-fingerprint" json:"client-fingerprint"`
+	Host                 string            `proxy:"host,omitempty" json:"host"`
+	Path                 string            `proxy:"path,omitempty" json:"path"`
+	HTTPVersion          string            `proxy:"http-version,omitempty" json:"http-version"`
+	Mode                 string            `proxy:"mode,omitempty" json:"mode"`
+	Headers              map[string]string `proxy:"headers,omitempty" json:"headers"`
+	NoGRPCHeader         bool              `proxy:"no-grpc-header,omitempty" json:"no-grpc-header"`
+	NoSSEHeader          bool              `proxy:"no-sse-header,omitempty" json:"no-sse-header"`
+	XPaddingBytes        Range             `proxy:"x-padding-bytes,omitempty" json:"x-padding-bytes"`
+	ScMaxEachPostBytes   Range             `proxy:"sc-max-each-post-bytes,omitempty" json:"sc-max-each-post-bytes"`
+	ScMinPostsIntervalMs Range             `proxy:"sc-min-posts-interval-ms,omitempty" json:"sc-min-posts-interval-ms"`
+	ScMaxBufferedPosts   Range             `proxy:"sc-max-buffered-posts,omitempty" json:"sc-max-buffered-posts"`
+	ScStreamUpServerSecs Range             `proxy:"sc-stream-up-server-secs,omitempty" json:"sc-stream-up-server-secs"`
+	Xmux                 *XmuxConfig       `proxy:"xmux,omitempty" json:"xmux"`
+	Download             *Config           `proxy:"download-settings,omitempty" json:"download-settings"`
+	ClientFingerprint    string            `proxy:"client-fingerprint,omitempty" json:"client-fingerprint"`
 
-	internalTLS *tls.Config `json:"-"`
+	internalTLS *tls.Config `proxy:"-" json:"-"`
 }
 
 func (c *Config) EnsureHTTP3TLS(fallbackHost string, skipVerify bool, httpVersion string) {
@@ -143,6 +144,32 @@ func (c *Config) internalTLSConfig() *tls.Config {
 	return c.internalTLS
 }
 
+// httpVersion resolves the HTTP version to use for server based on the
+// configured HTTPVersion and whether TLS is present.
+func (c *Config) httpVersion(hasTLS bool) string {
+	if c == nil {
+		if hasTLS {
+			return "2"
+		}
+		return "1.1"
+	}
+	v := strings.TrimSpace(strings.ToLower(c.HTTPVersion))
+	if v == "" || v == "auto" {
+		if hasTLS {
+			return "2"
+		}
+		return "1.1"
+	}
+	switch v {
+	case "3", "h3":
+		return "3"
+	case "2", "h2":
+		return "2"
+	default:
+		return "1.1"
+	}
+}
+
 func (c *Config) Clone() *Config {
 	return c.clone()
 }
@@ -155,12 +182,12 @@ func (c *Config) normalizedXmux() normalizedXmux {
 }
 
 type XmuxConfig struct {
-	MaxConcurrency   Range `proxy:"max-concurrency" json:"max-concurrency"`
-	MaxConnections   Range `proxy:"max-connections" json:"max-connections"`
-	CMaxReuseTimes   Range `proxy:"c-max-reuse-times" json:"c-max-reuse-times"`
-	HMaxRequestTimes Range `proxy:"h-max-request-times" json:"h-max-request-times"`
-	HMaxReusableSecs Range `proxy:"h-max-reusable-secs" json:"h-max-reusable-secs"`
-	HKeepAlivePeriod int64 `proxy:"h-keep-alive-period" json:"h-keep-alive-period"`
+	MaxConcurrency   Range `proxy:"max-concurrency,omitempty" json:"max-concurrency"`
+	MaxConnections   Range `proxy:"max-connections,omitempty" json:"max-connections"`
+	CMaxReuseTimes   Range `proxy:"c-max-reuse-times,omitempty" json:"c-max-reuse-times"`
+	HMaxRequestTimes Range `proxy:"h-max-request-times,omitempty" json:"h-max-request-times"`
+	HMaxReusableSecs Range `proxy:"h-max-reusable-secs,omitempty" json:"h-max-reusable-secs"`
+	HKeepAlivePeriod int64 `proxy:"h-keep-alive-period,omitempty" json:"h-keep-alive-period"`
 }
 
 func (x *XmuxConfig) clone() *XmuxConfig {
