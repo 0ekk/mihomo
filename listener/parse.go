@@ -141,6 +141,13 @@ func ParseListener(mapping map[string]any) (C.InboundListener, error) {
 			return nil, err
 		}
 		listener, err = IN.NewSudoku(sudokuOption)
+	case "xhttp":
+		xhttpOption := &IN.XhttpOption{}
+		err = decoder.Decode(mapping, xhttpOption)
+		if err != nil {
+			return nil, err
+		}
+		listener, err = IN.NewXhttp(xhttpOption)
 	default:
 		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
 	}

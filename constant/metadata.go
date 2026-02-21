@@ -41,6 +41,7 @@ const (
 	MIERU
 	SUDOKU
 	INNER
+	XHTTP
 )
 
 type AddrType byte
@@ -117,6 +118,8 @@ func (t Type) String() string {
 		return "Sudoku"
 	case INNER:
 		return "Inner"
+	case XHTTP:
+		return "Xhttp"
 	default:
 		return "Unknown"
 	}
@@ -161,6 +164,8 @@ func ParseType(t string) (*Type, error) {
 		res = SUDOKU
 	case "INNER":
 		res = INNER
+	case "XHTTP":
+		res = XHTTP
 	default:
 		return nil, fmt.Errorf("unknown type: %s", t)
 	}

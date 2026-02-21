@@ -9,13 +9,16 @@ import (
 
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/ech"
+	"github.com/metacubex/mihomo/component/proxydialer"
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/gun"
 	"github.com/metacubex/mihomo/transport/shadowsocks/core"
 	"github.com/metacubex/mihomo/transport/trojan"
 	"github.com/metacubex/mihomo/transport/vmess"
+	"github.com/metacubex/mihomo/transport/xhttp"
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/tls"
@@ -55,6 +58,7 @@ type TrojanOption struct {
 	RealityOpts       RealityOptions `proxy:"reality-opts,omitempty"`
 	GrpcOpts          GrpcOptions    `proxy:"grpc-opts,omitempty"`
 	WSOpts            WSOptions      `proxy:"ws-opts,omitempty"`
+	XHttpOpts         *xhttp.Config  `proxy:"xhttp-opts,omitempty"`
 	SSOpts            TrojanSSOption `proxy:"ss-opts,omitempty"`
 	ClientFingerprint string         `proxy:"client-fingerprint,omitempty"`
 }
@@ -195,7 +199,31 @@ func (t *Trojan) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Con
 
 		return NewConn(c, t), nil
 	}
-	c, err = t.dialer.DialContext(ctx, "tcp", t.addr)
+	return t.DialContextWithDialer(ctx, dialer.NewDialer(t.DialOptions()...), metadata)
+}
+
+// DialContextWithDialer implements C.ProxyAdapter
+func (t *Trojan) DialContextWithDialer(ctx context.Context, dialer C.Dialer, metadata *C.Metadata) (_ C.Conn, err error) {
+	if len(t.option.DialerProxy) > 0 {
+		dialer = proxydialer.NewByName(t.option.DialerProxy)
+	}
+
+	if t.option.Network == "xhttp" {
+		c, err := t.dialXHTTP(ctx, dialer)
+		if err != nil {
+			return nil, err
+		}
+		defer func(conn net.Conn) {
+			safeConnClose(conn, err)
+		}(c)
+		c, err = t.streamConnContext(ctx, c, metadata)
+		if err != nil {
+			return nil, err
+		}
+		return NewConn(c, t), nil
+	}
+
+	c, err := dialer.DialContext(ctx, "tcp", t.addr)
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %w", t.addr, err)
 	}
@@ -255,6 +283,86 @@ func (t *Trojan) ListenPacketContext(ctx context.Context, metadata *C.Metadata) 
 
 	pc := trojan.NewPacketConn(c)
 	return newPacketConn(pc, t), err
+}
+
+func (t *Trojan) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
+	cfg := t.option.XHttpOpts
+	if cfg == nil {
+		cfg = &xhttp.Config{}
+	} else {
+		cfg = cfg.Clone()
+	}
+	scheme := "https"
+	hostHeader := cfg.Host
+	if hostHeader == "" {
+		hostHeader = t.option.SNI
+		if hostHeader == "" {
+			if host, _, err := net.SplitHostPort(t.addr); err == nil {
+				hostHeader = host
+			} else {
+				hostHeader = t.addr
+			}
+		}
+	}
+	httpVersion := "2"
+	if len(t.option.ALPN) == 1 && t.option.ALPN[0] == "http/1.1" {
+		httpVersion = "1.1"
+	}
+	cfg.EnsureHTTP3TLS(hostHeader, t.option.SkipCertVerify)
+
+	dialFn := func(ctx context.Context, network string) (net.Conn, error) {
+		if network == "" {
+			network = "tcp"
+		}
+		conn, err := d.DialContext(ctx, network, t.addr)
+		if err != nil {
+			return nil, err
+		}
+		if network != "tcp" {
+			return conn, nil
+		}
+		alpn := t.option.ALPN
+		if len(alpn) == 0 {
+			alpn = trojan.DefaultALPN
+		}
+		if httpVersion == "2" {
+			alpn = []string{"h2"}
+		} else if len(alpn) == 0 || alpn[0] != "http/1.1" {
+			alpn = []string{"http/1.1"}
+		}
+		tlsCfg := &vmess.TLSConfig{
+			Host:              hostHeader,
+			SkipCertVerify:    t.option.SkipCertVerify,
+			FingerPrint:       t.option.Fingerprint,
+			Certificate:       t.option.Certificate,
+			PrivateKey:        t.option.PrivateKey,
+			ClientFingerprint: t.option.ClientFingerprint,
+			ECH:               t.echConfig,
+			Reality:           t.realityConfig,
+			NextProtos:        alpn,
+		}
+		conn, err = vmess.StreamTLSConn(ctx, conn, tlsCfg)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return conn, nil
+	}
+	return xhttp.Dial(ctx, xhttp.Options{
+		Dial:         dialFn,
+		Config:       cfg,
+		Scheme:       scheme,
+		HostHeader:   hostHeader,
+		Address:      t.addr,
+		HTTPVersion:  httpVersion,
+		PreferStream: t.realityConfig != nil,
+		Tag:          fmt.Sprintf("trojan[%s]", t.Name()),
+	})
+}
+
+// SupportWithDialer implements C.ProxyAdapter
+func (t *Trojan) SupportWithDialer() C.NetWork {
+	return C.ALLNet
 }
 
 // SupportUOT implements C.ProxyAdapter

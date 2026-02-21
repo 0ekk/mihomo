@@ -10,13 +10,16 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/ech"
+	"github.com/metacubex/mihomo/component/proxydialer"
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/gun"
 	"github.com/metacubex/mihomo/transport/vless"
 	"github.com/metacubex/mihomo/transport/vless/encryption"
 	"github.com/metacubex/mihomo/transport/vmess"
+	"github.com/metacubex/mihomo/transport/xhttp"
 
 	"github.com/metacubex/http"
 	vmessSing "github.com/metacubex/sing-vmess"
@@ -62,6 +65,7 @@ type VlessOption struct {
 	HTTP2Opts         HTTP2Options      `proxy:"h2-opts,omitempty"`
 	GrpcOpts          GrpcOptions       `proxy:"grpc-opts,omitempty"`
 	WSOpts            WSOptions         `proxy:"ws-opts,omitempty"`
+	XHttpOpts         *xhttp.Config     `proxy:"xhttp-opts,omitempty"`
 	WSHeaders         map[string]string `proxy:"ws-headers,omitempty"`
 	SkipCertVerify    bool              `proxy:"skip-cert-verify,omitempty"`
 	Fingerprint       string            `proxy:"fingerprint,omitempty"`
@@ -250,7 +254,31 @@ func (v *Vless) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn
 
 		return NewConn(c, v), nil
 	}
-	c, err = v.dialer.DialContext(ctx, "tcp", v.addr)
+	return v.DialContextWithDialer(ctx, dialer.NewDialer(v.DialOptions()...), metadata)
+}
+
+// DialContextWithDialer implements C.ProxyAdapter
+func (v *Vless) DialContextWithDialer(ctx context.Context, dialer C.Dialer, metadata *C.Metadata) (_ C.Conn, err error) {
+	if len(v.option.DialerProxy) > 0 {
+		dialer = proxydialer.NewByName(v.option.DialerProxy)
+	}
+
+	if v.option.Network == "xhttp" {
+		c, err := v.dialXHTTP(ctx, dialer)
+		if err != nil {
+			return nil, err
+		}
+		defer func(c net.Conn) {
+			safeConnClose(c, err)
+		}(c)
+		c, err = v.streamConnContext(ctx, c, metadata)
+		if err != nil {
+			return nil, err
+		}
+		return NewConn(c, v), nil
+	}
+
+	c, err := dialer.DialContext(ctx, "tcp", v.addr)
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
 	}
@@ -263,6 +291,67 @@ func (v *Vless) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn
 		return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
 	}
 	return NewConn(c, v), err
+}
+
+func (v *Vless) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
+	cfg := v.option.XHttpOpts
+	if cfg == nil {
+		cfg = &xhttp.Config{}
+	} else {
+		cfg = cfg.Clone()
+	}
+	scheme := "http"
+	if v.option.TLS || v.realityConfig != nil {
+		scheme = "https"
+	}
+	hostHeader := cfg.Host
+	if hostHeader == "" {
+		hostHeader = v.option.ServerName
+		if hostHeader == "" {
+			if host, _, err := net.SplitHostPort(v.addr); err == nil {
+				hostHeader = host
+			} else {
+				hostHeader = v.addr
+			}
+		}
+	}
+	httpVersion := "1.1"
+	if scheme == "https" {
+		httpVersion = "2"
+	}
+	if len(v.option.ALPN) == 1 && v.option.ALPN[0] == "http/1.1" {
+		httpVersion = "1.1"
+	}
+	cfg.EnsureHTTP3TLS(hostHeader, v.option.SkipCertVerify)
+
+	dialFn := func(ctx context.Context, network string) (net.Conn, error) {
+		if network == "" {
+			network = "tcp"
+		}
+		conn, err := d.DialContext(ctx, network, v.addr)
+		if err != nil {
+			return nil, err
+		}
+		if network != "tcp" {
+			return conn, nil
+		}
+		conn, err = v.streamTLSConn(ctx, conn, httpVersion == "2")
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return conn, nil
+	}
+	return xhttp.Dial(ctx, xhttp.Options{
+		Dial:         dialFn,
+		Config:       cfg,
+		Scheme:       scheme,
+		HostHeader:   hostHeader,
+		Address:      v.addr,
+		HTTPVersion:  httpVersion,
+		PreferStream: v.realityConfig != nil,
+		Tag:          fmt.Sprintf("vless[%s]", v.Name()),
+	})
 }
 
 // ListenPacketContext implements C.ProxyAdapter
@@ -293,7 +382,23 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 		return nil, err
 	}
 
-	c, err = v.dialer.DialContext(ctx, "tcp", v.addr)
+	d := v.dialer
+	if v.option.Network == "xhttp" {
+		c, err := v.dialXHTTP(ctx, d)
+		if err != nil {
+			return nil, err
+		}
+		defer func(c net.Conn) {
+			safeConnClose(c, err)
+		}(c)
+		c, err = v.streamConnContext(ctx, c, metadata)
+		if err != nil {
+			return nil, err
+		}
+		return v.ListenPacketOnStreamConn(ctx, c, metadata)
+	}
+
+	c, err = d.DialContext(ctx, "tcp", v.addr)
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
 	}
