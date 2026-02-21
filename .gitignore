@@ -26,3 +26,5 @@ test/config/cache*
 /output
 .vscode/
 .fleet/
+# Build artifacts (cross-compiled binaries)
+build_artifacts/
