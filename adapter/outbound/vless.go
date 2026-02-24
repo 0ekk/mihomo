@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
+	"strings"
 
 	"github.com/metacubex/mihomo/common/convert"
 	N "github.com/metacubex/mihomo/common/net"
@@ -181,6 +183,15 @@ func (v *Vless) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 		}
 	}
 	if metadata.NetWork == C.UDP {
+		switch v.option.Flow {
+		case vless.XRV:
+			if metadata.DstPort == 443 {
+				err = fmt.Errorf("rejected UDP/443 traffic")
+				return
+			}
+		case vless.XRVU:
+			
+		}
 		if v.option.PacketAddr {
 			metadata = &C.Metadata{
 				NetWork: C.UDP,
@@ -316,11 +327,32 @@ func (v *Vless) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
 		}
 	}
 	httpVersion := "1.1"
-	if scheme == "https" {
-		httpVersion = "2"
-	}
-	if len(v.option.ALPN) == 1 && v.option.ALPN[0] == "http/1.1" {
-		httpVersion = "1.1"
+	configuredHTTPVersion := strings.TrimSpace(strings.ToLower(cfg.HTTPVersion))
+	if configuredHTTPVersion == "" || configuredHTTPVersion == "auto" {
+		if scheme == "https" {
+			httpVersion = "2"
+		}
+		if v.realityConfig == nil && len(v.option.ALPN) == 1 {
+			switch strings.TrimSpace(strings.ToLower(v.option.ALPN[0])) {
+			case "h3", "http/3":
+				httpVersion = "3"
+			case "http/1.1":
+				httpVersion = "1.1"
+			}
+		}
+	} else {
+		switch configuredHTTPVersion {
+		case "3", "h3":
+			if v.realityConfig == nil {
+				httpVersion = "3"
+			} else {
+				httpVersion = "2"
+			}
+		case "2", "h2":
+			httpVersion = "2"
+		default:
+			httpVersion = "1.1"
+		}
 	}
 	cfg.EnsureHTTP3TLS(hostHeader, v.option.SkipCertVerify, httpVersion)
 
@@ -330,12 +362,43 @@ func (v *Vless) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
 	}
 
 	dialFn := func(ctx context.Context, network string) (net.Conn, error) {
+		if d == nil {
+			return nil, fmt.Errorf("dial failed")
+		}
 		if network == "" {
 			network = "tcp"
 		}
+		if network == "udp" {
+			udpConn, err := d.DialContext(ctx, network, v.addr)
+			if err != nil {
+				return nil, err
+			}
+			if udpConn == nil {
+				return nil, fmt.Errorf("dial failed")
+			}
+			remoteAddr, ok := udpConn.RemoteAddr().(*net.UDPAddr)
+			_ = udpConn.Close()
+			if !ok {
+				return nil, fmt.Errorf("dial failed")
+			}
+			ip, ok := netip.AddrFromSlice(remoteAddr.IP)
+			if !ok {
+				return nil, fmt.Errorf("dial failed")
+			}
+			rAddrPort := netip.AddrPortFrom(ip.Unmap(), uint16(remoteAddr.Port))
+			packetConn, err := d.ListenPacket(ctx, "udp", "", rAddrPort)
+			if err != nil {
+				return nil, err
+			}
+			return N.NewBindPacketConn(packetConn, remoteAddr), nil
+		}
+
 		conn, err := d.DialContext(ctx, network, v.addr)
 		if err != nil {
 			return nil, err
+		}
+		if conn == nil {
+			return nil, fmt.Errorf("dial failed")
 		}
 		if network != "tcp" {
 			return conn, nil
@@ -360,15 +423,16 @@ func (v *Vless) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
 			if v.option.ServerName != "" {
 				tlsOpts.Host = v.option.ServerName
 			}
-			conn, err = vmess.StreamTLSConn(ctx, conn, &tlsOpts)
-			if err != nil {
+			tlsConn, tlsErr := vmess.StreamTLSConn(ctx, conn, &tlsOpts)
+			if tlsErr != nil {
 				_ = conn.Close()
-				return nil, err
+				return nil, tlsErr
 			}
+			conn = tlsConn
 		}
 		return conn, nil
 	}
-	return xhttp.Dial(ctx, xhttp.Options{
+	dialOpts := xhttp.Options{
 		Dial:         dialFn,
 		Config:       cfg,
 		Scheme:       scheme,
@@ -377,7 +441,13 @@ func (v *Vless) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
 		HTTPVersion:  httpVersion,
 		PreferStream: v.realityConfig != nil,
 		Tag:          fmt.Sprintf("vless[%s]", v.Name()),
-	})
+	}
+
+	conn, err := xhttp.Dial(ctx, dialOpts)
+	if err == nil {
+		return conn, nil
+	}
+	return nil, err
 }
 
 // ListenPacketContext implements C.ProxyAdapter
@@ -515,13 +585,17 @@ func parseVlessAddr(metadata *C.Metadata, xudp bool) *vless.DstAddr {
 
 func NewVless(option VlessOption) (*Vless, error) {
 	var addons *vless.Addons
-	if len(option.Flow) >= 16 {
-		option.Flow = option.Flow[:16]
-		if option.Flow != vless.XRV {
+	option.Flow = strings.TrimSpace(option.Flow)
+	if option.Flow != "" {
+		switch option.Flow {
+		case vless.XRV, vless.XRVU:
+			flowOnWire := option.Flow
+			if flowOnWire == vless.XRVU {
+				flowOnWire = vless.XRV
+			}
+			addons = &vless.Addons{Flow: flowOnWire}
+		default:
 			return nil, fmt.Errorf("unsupported xtls flow type: %s", option.Flow)
-		}
-		addons = &vless.Addons{
-			Flow: option.Flow,
 		}
 	}
 

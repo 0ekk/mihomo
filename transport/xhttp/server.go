@@ -29,6 +29,43 @@ type requestHandler struct {
 	additions []inbound.Addition
 }
 
+type streamUploadConn struct {
+	io.ReadCloser
+	writer http.ResponseWriter
+	done   chan struct{}
+	once   sync.Once
+}
+
+func newStreamUploadConn(body io.ReadCloser, writer http.ResponseWriter) *streamUploadConn {
+	return &streamUploadConn{
+		ReadCloser: body,
+		writer:     writer,
+		done:       make(chan struct{}),
+	}
+}
+
+func (s *streamUploadConn) Close() error {
+	err := s.ReadCloser.Close()
+	s.once.Do(func() {
+		close(s.done)
+	})
+	return err
+}
+
+func (s *streamUploadConn) Wait() <-chan struct{} {
+	return s.done
+}
+
+func (s *streamUploadConn) Write(p []byte) (int, error) {
+	n, err := s.writer.Write(p)
+	if err == nil {
+		if f, ok := s.writer.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+	return n, err
+}
+
 func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := h.validateRequest(r); err != nil {
 		log.Debugln("xhttp: validation failed: %v", err)
@@ -224,8 +261,11 @@ func (h *requestHandler) handleStreamUpload(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	httpSC := newStreamUploadConn(r.Body, w)
+ 	defer httpSC.Close()
+
 	packet := Packet{
-		Reader: r.Body,
+		Reader: httpSC,
 		Seq:    0,
 	}
 
@@ -250,7 +290,36 @@ func (h *requestHandler) handleStreamUpload(w http.ResponseWriter, r *http.Reque
 		})
 	}
 
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
+
+	if referrer := r.Header.Get("Referer"); referrer != "" && !h.config.ScStreamUpServerSecs.IsZero() {
+		if secs := h.config.ScStreamUpServerSecs.Random(); secs > 0 {
+			go func(interval time.Duration) {
+				ticker := time.NewTicker(interval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-httpSC.Wait():
+						return
+					case <-r.Context().Done():
+						return
+					case <-ticker.C:
+						_, writeErr := httpSC.Write([]byte{'X'})
+						if writeErr != nil {
+							return
+						}
+					}
+				}
+			}(time.Duration(secs) * time.Second)
+		}
+	}
+
+	select {
+	case <-r.Context().Done():
+	case <-httpSC.Wait():
+	}
 }
 
 func (h *requestHandler) handlePacketUpload(w http.ResponseWriter, r *http.Request, sessionID string, seq uint64) {
