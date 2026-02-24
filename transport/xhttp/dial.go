@@ -16,7 +16,6 @@ import (
 	"github.com/gofrs/uuid/v5"
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/httptrace"
-	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/quic-go"
 	http3 "github.com/metacubex/quic-go/http3"
 	"github.com/metacubex/tls"
@@ -113,11 +112,6 @@ func Dial(ctx context.Context, opts Options) (net.Conn, error) {
 	}
 
 	mode := resolveMode(cfg.Mode, opts.PreferStream, downloadCfg != cfg)
-	logTag := opts.Tag
-	if logTag == "" {
-		logTag = "xhttp"
-	}
-	log.Debugln("%s: dialing %s via %s (mode=%s, http=%s)", logTag, opts.Address, uploadEP.url, mode, uploadEP.httpVersion)
 
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -498,13 +492,29 @@ func newHTTPClient(httpVersion string, dial DialFunc, keepAlive time.Duration, t
 				}
 				packetConn, ok := conn.(net.PacketConn)
 				if !ok {
-					return nil, fmt.Errorf("xhttp: http3 requires UDP connection")
+					_ = conn.Close()
+					return nil, fmt.Errorf("dial requires net.PacketConn, got %T", conn)
 				}
-				udpAddr, err := net.ResolveUDPAddr("udp", addr)
+
+				var udpAddr *net.UDPAddr
+				if remoteAddr := conn.RemoteAddr(); remoteAddr != nil {
+					if resolvedRemote, ok := remoteAddr.(*net.UDPAddr); ok {
+						udpAddr = resolvedRemote
+					}
+				}
+				if udpAddr == nil {
+					udpAddr, err = net.ResolveUDPAddr("udp", addr)
+					if err != nil {
+						_ = conn.Close()
+						return nil, err
+					}
+				}
+				quicConn, err := quic.DialEarly(ctx, packetConn, udpAddr, tlsCfg, cfg)
 				if err != nil {
+					_ = conn.Close()
 					return nil, err
 				}
-				return quic.DialEarly(ctx, packetConn, udpAddr, tlsCfg, cfg)
+				return quicConn, nil
 			},
 		}
 		return &http.Client{Transport: transport}, transport, nil
