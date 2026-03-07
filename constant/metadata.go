@@ -40,6 +40,7 @@ const (
 	ANYTLS
 	MIERU
 	SUDOKU
+	TRUSTTUNNEL
 	INNER
 	XHTTP
 )
@@ -116,6 +117,8 @@ func (t Type) String() string {
 		return "Mieru"
 	case SUDOKU:
 		return "Sudoku"
+	case TRUSTTUNNEL:
+		return "TrustTunnel"
 	case INNER:
 		return "Inner"
 	case XHTTP:
@@ -162,6 +165,8 @@ func ParseType(t string) (*Type, error) {
 		res = MIERU
 	case "SUDOKU":
 		res = SUDOKU
+	case "TRUSTTUNNEL":
+		res = TRUSTTUNNEL
 	case "INNER":
 		res = INNER
 	case "XHTTP":

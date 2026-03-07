@@ -174,7 +174,11 @@ func TestXHTTPWithRealTLSFingerprint(t *testing.T) {
 					}
 
 					if fp, ok := tlsC.GetFingerprint(tt.fingerprint); ok {
-						utlsConfig := tlsC.UConfig(tlsConfig)
+						utlsConfig := &tlsC.Config{
+							InsecureSkipVerify: tlsConfig.InsecureSkipVerify,
+							ServerName:         tlsConfig.ServerName,
+							NextProtos:         tlsConfig.NextProtos,
+						}
 						utlsConn := tlsC.UClient(conn, utlsConfig, fp)
 						if err := utlsConn.HandshakeContext(ctx); err != nil {
 							conn.Close()
@@ -293,7 +297,11 @@ func TestXHTTPFingerprintOverride(t *testing.T) {
 
 		// Use the determined fingerprint
 		if fp, ok := tlsC.GetFingerprint(usedFingerprint); ok {
-			utlsConfig := tlsC.UConfig(tlsConfig)
+			utlsConfig := &tlsC.Config{
+				InsecureSkipVerify: tlsConfig.InsecureSkipVerify,
+				ServerName:         tlsConfig.ServerName,
+				NextProtos:         tlsConfig.NextProtos,
+			}
 			utlsConn := tlsC.UClient(conn, utlsConfig, fp)
 			if err := utlsConn.HandshakeContext(ctx); err != nil {
 				conn.Close()

@@ -2,6 +2,7 @@ package inbound
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 
@@ -304,7 +305,11 @@ func (x *Xhttp) Close() error {
 		x.cancel()
 	}
 	if x.listener != nil {
-		return x.listener.Close()
+		err := x.listener.Close()
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
 	}
 	return nil
 }

@@ -294,6 +294,12 @@ func (h *requestHandler) handleStreamUpload(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 
+	// In tests or misconfiguration where no tunnel is attached, return immediately.
+	// Otherwise this handler can block forever waiting for stream closure signals.
+	if h.tunnel == nil {
+		return
+	}
+
 	if referrer := r.Header.Get("Referer"); referrer != "" && !h.config.ScStreamUpServerSecs.IsZero() {
 		if secs := h.config.ScStreamUpServerSecs.Random(); secs > 0 {
 			go func(interval time.Duration) {

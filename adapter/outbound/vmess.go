@@ -37,9 +37,8 @@ type Vmess struct {
 	option *VmessOption
 
 	// for gun mux
-	gunTLSConfig *tls.Config
 	gunConfig    *gun.Config
-	transport    *gun.TransportWrap
+	gunTransport *gun.TransportWrap
 
 	realityConfig *tlsC.RealityConfig
 	echConfig     *ech.Config
@@ -102,7 +101,6 @@ type WSOptions struct {
 	V2rayHttpUpgradeFastOpen bool              `proxy:"v2ray-http-upgrade-fast-open,omitempty"`
 }
 
-// StreamConnContext implements C.ProxyAdapter
 func (v *Vmess) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.Metadata) (_ net.Conn, err error) {
 	switch v.option.Network {
 	case "ws":
@@ -209,7 +207,7 @@ func (v *Vmess) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 
 		c, err = mihomoVMess.StreamH2Conn(ctx, c, h2Opts)
 	case "grpc":
-		c, err = gun.StreamGunWithConn(c, v.gunTLSConfig, v.gunConfig, v.echConfig, v.realityConfig)
+		break // already handle in gun transport
 	default:
 		// handle TLS
 		if v.option.TLS {
@@ -298,24 +296,6 @@ func (v *Vmess) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 
 // DialContext implements C.ProxyAdapter
 func (v *Vmess) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
-	var c net.Conn
-	// gun transport
-	if v.transport != nil {
-		c, err = gun.StreamGunWithTransport(v.transport, v.gunConfig)
-		if err != nil {
-			return nil, err
-		}
-		defer func(c net.Conn) {
-			safeConnClose(c, err)
-		}(c)
-
-		c, err = v.streamConnContext(ctx, c, metadata)
-		if err != nil {
-			return nil, err
-		}
-
-		return NewConn(c, v), nil
-	}
 	return v.DialContextWithDialer(ctx, dialer.NewDialer(v.DialOptions()...), metadata)
 }
 
@@ -325,8 +305,10 @@ func (v *Vmess) DialContextWithDialer(ctx context.Context, dialer C.Dialer, meta
 		dialer = proxydialer.NewByName(v.option.DialerProxy)
 	}
 
+	var c net.Conn
+
 	if v.option.Network == "xhttp" {
-		c, err := v.dialXHTTP(ctx, dialer)
+		c, err = v.dialXHTTP(ctx, dialer)
 		if err != nil {
 			return nil, err
 		}
@@ -335,9 +317,12 @@ func (v *Vmess) DialContextWithDialer(ctx context.Context, dialer C.Dialer, meta
 		}(c)
 		c, err = v.streamConnContext(ctx, c, metadata)
 		return NewConn(c, v), err
+	} else if v.gunTransport != nil {
+		c, err = gun.StreamGunWithTransport(v.gunTransport, v.gunConfig)
+	} else {
+		c, err = dialer.DialContext(ctx, "tcp", v.addr)
 	}
 
-	c, err := dialer.DialContext(ctx, "tcp", v.addr)
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
 	}
@@ -355,26 +340,6 @@ func (v *Vmess) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 		return nil, err
 	}
 	var c net.Conn
-	// gun transport
-	if v.transport != nil {
-		c, err = gun.StreamGunWithTransport(v.transport, v.gunConfig)
-		if err != nil {
-			return nil, err
-		}
-		defer func(c net.Conn) {
-			safeConnClose(c, err)
-		}(c)
-
-		c, err = v.streamConnContext(ctx, c, metadata)
-		if err != nil {
-			return nil, fmt.Errorf("new vmess client error: %v", err)
-		}
-		return v.ListenPacketOnStreamConn(ctx, c, metadata)
-	}
-
-	if err = v.ResolveUDP(ctx, metadata); err != nil {
-		return nil, err
-	}
 
 	d := v.dialer
 	if v.option.Network == "xhttp" {
@@ -392,7 +357,11 @@ func (v *Vmess) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 		return v.ListenPacketOnStreamConn(ctx, c, metadata)
 	}
 
-	c, err = d.DialContext(ctx, "tcp", v.addr)
+	if v.gunTransport != nil {
+		c, err = gun.StreamGunWithTransport(v.gunTransport, v.gunConfig)
+	} else {
+		c, err = d.DialContext(ctx, "tcp", v.addr)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
 	}
@@ -507,8 +476,8 @@ func (v *Vmess) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
 
 // Close implements C.ProxyAdapter
 func (v *Vmess) Close() error {
-	if v.transport != nil {
-		return v.transport.Close()
+	if v.gunTransport != nil {
+		return v.gunTransport.Close()
 	}
 	return nil
 }
@@ -599,38 +568,35 @@ func NewVmess(option VmessOption) (*Vmess, error) {
 		}
 
 		gunConfig := &gun.Config{
-			ServiceName:       v.option.GrpcOpts.GrpcServiceName,
-			UserAgent:         v.option.GrpcOpts.GrpcUserAgent,
-			Host:              v.option.ServerName,
-			ClientFingerprint: v.option.ClientFingerprint,
+			ServiceName: option.GrpcOpts.GrpcServiceName,
+			UserAgent:   option.GrpcOpts.GrpcUserAgent,
+			Host:        option.ServerName,
 		}
 		if option.ServerName == "" {
 			gunConfig.Host = v.addr
 		}
-		var tlsConfig *tls.Config
+		var tlsConfig *mihomoVMess.TLSConfig
 		if option.TLS {
-			tlsConfig, err = ca.GetTLSConfig(ca.Option{
-				TLSConfig: &tls.Config{
-					InsecureSkipVerify: v.option.SkipCertVerify,
-					ServerName:         v.option.ServerName,
-				},
-				Fingerprint: v.option.Fingerprint,
-				Certificate: v.option.Certificate,
-				PrivateKey:  v.option.PrivateKey,
-			})
-			if err != nil {
-				return nil, err
+			tlsConfig = &mihomoVMess.TLSConfig{
+				Host:              option.ServerName,
+				SkipCertVerify:    option.SkipCertVerify,
+				FingerPrint:       option.Fingerprint,
+				Certificate:       option.Certificate,
+				PrivateKey:        option.PrivateKey,
+				ClientFingerprint: option.ClientFingerprint,
+				NextProtos:        []string{"h2"},
+				ECH:               v.echConfig,
+				Reality:           v.realityConfig,
 			}
 			if option.ServerName == "" {
 				host, _, _ := net.SplitHostPort(v.addr)
-				tlsConfig.ServerName = host
+				tlsConfig.Host = host
 			}
 		}
 
-		v.gunTLSConfig = tlsConfig
 		v.gunConfig = gunConfig
 
-		v.transport = gun.NewHTTP2Client(dialFn, tlsConfig, v.option.ClientFingerprint, v.echConfig, v.realityConfig)
+		v.gunTransport = gun.NewHTTP2Client(dialFn, tlsConfig)
 	}
 
 	return v, nil
