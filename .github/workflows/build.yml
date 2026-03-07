@@ -12,11 +12,13 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
     branches:
       - Alpha
+      - alpha-xhttp-dev1
     tags:
       - "v*"
   pull_request:
     branches:
       - Alpha
+      - alpha-xhttp-dev1
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
   cancel-in-progress: true
@@ -27,6 +29,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         jobs:
           - { goos: darwin, goarch: amd64, goamd64: v1, output: amd64-compatible } # old style file name will be removed in next released
@@ -278,6 +281,8 @@ jobs:
           VERSION=${{ github.event.inputs.version }}
           PackageVersion="${VERSION#v}"
         fi
+        # Debian/RPM version must not contain underscores; replace with hyphens
+        PackageVersion="${PackageVersion//_/-}"
         echo "VERSION=${VERSION}" >> $GITHUB_ENV
         echo "PackageVersion=${PackageVersion}" >> $GITHUB_ENV
       
@@ -451,7 +456,7 @@ jobs:
 
   Upload-Release:
     permissions: write-all
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
+    if: ${{ false && github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
     needs: [build]
     runs-on: ubuntu-latest
     steps:
@@ -509,7 +514,7 @@ jobs:
           body_path: release.md
 
   Docker:
-    if: ${{ !startsWith(github.event_name, 'pull_request') }}
+    if: ${{ false && !startsWith(github.event_name, 'pull_request') }}
     permissions: write-all
     needs: [build]
     runs-on: ubuntu-latest

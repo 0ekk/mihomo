@@ -16,15 +16,35 @@ jobs:
   trigger-CMFA-update:
     runs-on: ubuntu-latest
     steps:
+      - name: Check maintainer app secrets
+        id: check-secrets
+        shell: bash
+        env:
+          MAINTAINER_APPID: ${{ secrets.MAINTAINER_APPID }}
+          MAINTAINER_APP_PRIVATE_KEY: ${{ secrets.MAINTAINER_APP_PRIVATE_KEY }}
+        run: |
+          if [[ -n "$MAINTAINER_APPID" && -n "$MAINTAINER_APP_PRIVATE_KEY" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping CMFA update trigger because required secrets are not configured."
+          fi
+
       - uses: tibdex/github-app-token@v1
         id: generate-token
+        if: steps.check-secrets.outputs.ready == 'true'
         with:
           app_id: ${{ secrets.MAINTAINER_APPID }}
           private_key: ${{ secrets.MAINTAINER_APP_PRIVATE_KEY }}
       
       - name: Trigger update-dependencies
+        if: steps.check-secrets.outputs.ready == 'true'
         run: |
           curl -X POST https://api.github.com/repos/MetaCubeX/ClashMetaForAndroid/dispatches \
             -H "Accept: application/vnd.github.everest-preview+json" \
             -H "Authorization: token ${{ steps.generate-token.outputs.token }}" \
             -d '{"event_type": "core-updated"}'
+
+      - name: Secrets missing, skip trigger
+        if: steps.check-secrets.outputs.ready != 'true'
+        run: echo "CMFA update trigger skipped because maintainer app secrets are missing."
