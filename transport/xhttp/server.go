@@ -27,6 +27,7 @@ type requestHandler struct {
 	sessions  sync.Map
 	tunnel    C.Tunnel
 	additions []inbound.Addition
+	idleTimeout time.Duration
 }
 
 type streamUploadConn struct {
@@ -152,7 +153,9 @@ func (h *requestHandler) parseSeq(path string) (uint64, error) {
 
 func (h *requestHandler) getOrCreateSession(sessionId string) (*httpSession, error) {
 	if val, ok := h.sessions.Load(sessionId); ok {
-		return val.(*httpSession), nil
+		session := val.(*httpSession)
+		session.touch(h.idleTimeout)
+		return session, nil
 	}
 
 	maxPackets := DefaultMaxPackets
@@ -161,8 +164,77 @@ func (h *requestHandler) getOrCreateSession(sessionId string) (*httpSession, err
 	}
 
 	session := newHTTPSession(sessionId, maxPackets)
+	session.touch(h.idleTimeout)
 	actual, _ := h.sessions.LoadOrStore(sessionId, session)
-	return actual.(*httpSession), nil
+	loaded := actual.(*httpSession)
+	loaded.touch(h.idleTimeout)
+	return loaded, nil
+}
+
+func (h *requestHandler) closeAndDeleteSession(sessionID string, session *httpSession) {
+	if session != nil {
+		session.close()
+	}
+	h.sessions.Delete(sessionID)
+}
+
+func (h *requestHandler) cleanupExpiredSessions(now time.Time) {
+	h.sessions.Range(func(key, value any) bool {
+		sessionID, ok := key.(string)
+		if !ok {
+			return true
+		}
+		session, ok := value.(*httpSession)
+		if !ok {
+			return true
+		}
+		if session.closed.Load() || session.isExpired(now) {
+			h.closeAndDeleteSession(sessionID, session)
+		}
+		return true
+	})
+}
+
+func (h *requestHandler) closeAllSessions() {
+	h.sessions.Range(func(key, value any) bool {
+		sessionID, ok := key.(string)
+		if !ok {
+			return true
+		}
+		session, ok := value.(*httpSession)
+		if !ok {
+			return true
+		}
+		h.closeAndDeleteSession(sessionID, session)
+		return true
+	})
+}
+
+func (h *requestHandler) runSessionJanitor(ctx context.Context) {
+	if h.idleTimeout <= 0 {
+		return
+	}
+
+	cleanupInterval := DefaultSessionCleanupInterval
+	if h.idleTimeout < cleanupInterval {
+		cleanupInterval = h.idleTimeout / 2
+		if cleanupInterval < time.Second {
+			cleanupInterval = time.Second
+		}
+	}
+
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			h.closeAllSessions()
+			return
+		case now := <-ticker.C:
+			h.cleanupExpiredSessions(now)
+		}
+	}
 }
 
 func (h *requestHandler) applyResponseHeaders(w http.ResponseWriter) {
@@ -187,6 +259,7 @@ func (h *requestHandler) handleDownload(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+	session.touch(h.idleTimeout)
 
 	h.applyResponseHeaders(w)
 	w.WriteHeader(http.StatusOK)
@@ -215,15 +288,14 @@ func (h *requestHandler) handleDownload(w http.ResponseWriter, r *http.Request, 
 		select {
 		case data, ok := <-session.downloadQueue:
 			if !ok {
-				session.close()
-				h.sessions.Delete(sessionID)
+				h.closeAndDeleteSession(sessionID, session)
 				return
 			}
+			session.touch(h.idleTimeout)
 			lastActivity = time.Now()
 			if _, writeErr := w.Write(data); writeErr != nil {
 				log.Debugln("xhttp: download write error: %v", writeErr)
-				session.close()
-				h.sessions.Delete(sessionID)
+				h.closeAndDeleteSession(sessionID, session)
 				return
 			}
 			if f, ok := w.(http.Flusher); ok {
@@ -232,18 +304,17 @@ func (h *requestHandler) handleDownload(w http.ResponseWriter, r *http.Request, 
 
 		case <-r.Context().Done():
 			log.Debugln("xhttp: client disconnected, closing session %s", sessionID)
-			session.close()
-			h.sessions.Delete(sessionID)
+			h.closeAndDeleteSession(sessionID, session)
 			return
 
 		case <-pollTicker.C:
 			if keepAliveTicker != nil && time.Since(lastActivity) >= keepAliveInterval {
 				if _, writeErr := w.Write(keepAliveByte); writeErr != nil {
 					log.Debugln("xhttp: keep-alive write error: %v", writeErr)
-					session.close()
-					h.sessions.Delete(sessionID)
+					h.closeAndDeleteSession(sessionID, session)
 					return
 				}
+				session.touch(h.idleTimeout)
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
 				}
@@ -260,6 +331,7 @@ func (h *requestHandler) handleStreamUpload(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+	session.touch(h.idleTimeout)
 
 	httpSC := newStreamUploadConn(r.Body, w)
  	defer httpSC.Close()
@@ -274,6 +346,7 @@ func (h *requestHandler) handleStreamUpload(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+	session.touch(h.idleTimeout)
 
 	remoteAddr, _ := net.ResolveTCPAddr("tcp", r.RemoteAddr)
 	localAddr, _ := net.ResolveTCPAddr("tcp", r.Host)
@@ -326,6 +399,7 @@ func (h *requestHandler) handleStreamUpload(w http.ResponseWriter, r *http.Reque
 	case <-r.Context().Done():
 	case <-httpSC.Wait():
 	}
+	session.touch(h.idleTimeout)
 }
 
 func (h *requestHandler) handlePacketUpload(w http.ResponseWriter, r *http.Request, sessionID string, seq uint64) {
@@ -335,6 +409,7 @@ func (h *requestHandler) handlePacketUpload(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+	session.touch(h.idleTimeout)
 
 	maxBytes := int(h.config.ScMaxEachPostBytes.Random())
 	if maxBytes <= 0 {
@@ -359,6 +434,7 @@ func (h *requestHandler) handlePacketUpload(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+	session.touch(h.idleTimeout)
 
 	remoteAddr, _ := net.ResolveTCPAddr("tcp", r.RemoteAddr)
 	localAddr, _ := net.ResolveTCPAddr("tcp", r.Host)
@@ -386,6 +462,7 @@ func NewHTTP1Server(config *Config, tunnel C.Tunnel, additions []inbound.Additio
 		config:    config,
 		tunnel:    tunnel,
 		additions: additions,
+		idleTimeout: DefaultSessionIdleTimeout,
 	}
 	return &http.Server{
 		Handler: handler,
@@ -406,6 +483,7 @@ func NewHTTP2Server(config *Config, tunnel C.Tunnel, additions []inbound.Additio
 		config:    config,
 		tunnel:    tunnel,
 		additions: additions,
+		idleTimeout: DefaultSessionIdleTimeout,
 	}
 	srv := &http.Server{
 		Handler:   handler,
@@ -436,6 +514,7 @@ func NewHTTP3Server(config *Config, tunnel C.Tunnel, additions []inbound.Additio
 		config:    config,
 		tunnel:    tunnel,
 		additions: additions,
+		idleTimeout: DefaultSessionIdleTimeout,
 	}
 	quicCfg := &quic.Config{
 		MaxIdleTimeout: 60 * 1000000000,
@@ -459,6 +538,12 @@ func NewServer(ctx context.Context, config *Config, tunnel C.Tunnel, additions [
 
 	config.normalize()
 	httpVersion := config.httpVersion(tlsCfg != nil)
+	handler := &requestHandler{
+		config:      config,
+		tunnel:      tunnel,
+		additions:   additions,
+		idleTimeout: DefaultSessionIdleTimeout,
+	}
 
 	switch httpVersion {
 	case "3":
@@ -470,6 +555,7 @@ func NewServer(ctx context.Context, config *Config, tunnel C.Tunnel, additions [
 		if err != nil {
 			return err
 		}
+		srv.Handler = handler
 		packetConn, ok := listener.(net.PacketConn)
 		if !ok {
 			return errors.New("xhttp: HTTP/3 requires PacketConn listener")
@@ -483,6 +569,7 @@ func NewServer(ctx context.Context, config *Config, tunnel C.Tunnel, additions [
 			<-ctx.Done()
 			srv.Close()
 		}()
+		go handler.runSessionJanitor(ctx)
 		return nil
 
 	case "2":
@@ -494,6 +581,7 @@ func NewServer(ctx context.Context, config *Config, tunnel C.Tunnel, additions [
 		if err != nil {
 			return err
 		}
+		srv.Handler = handler
 		go func() {
 			if err := srv.ServeTLS(listener, "", ""); err != nil && err != http.ErrServerClosed {
 				log.Errorln("xhttp: HTTP/2 server error: %v", err)
@@ -503,6 +591,7 @@ func NewServer(ctx context.Context, config *Config, tunnel C.Tunnel, additions [
 			<-ctx.Done()
 			srv.Close()
 		}()
+		go handler.runSessionJanitor(ctx)
 		return nil
 
 	default:
@@ -510,6 +599,7 @@ func NewServer(ctx context.Context, config *Config, tunnel C.Tunnel, additions [
 		if err != nil {
 			return err
 		}
+		srv.Handler = handler
 		go func() {
 			if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
 				log.Errorln("xhttp: HTTP/1.1 server error: %v", err)
@@ -519,6 +609,7 @@ func NewServer(ctx context.Context, config *Config, tunnel C.Tunnel, additions [
 			<-ctx.Done()
 			srv.Close()
 		}()
+		go handler.runSessionJanitor(ctx)
 		return nil
 	}
 }

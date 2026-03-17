@@ -11,6 +11,7 @@ import (
 type clientSlot struct {
 	client           *http.Client
 	transport        http.RoundTripper
+	manager          *xmuxManager
 	cfg              normalizedXmux
 	remainingUses    int32
 	remainingRequest int32
@@ -33,6 +34,13 @@ func (s *clientSlot) shouldDrop(now time.Time) bool {
 }
 
 func (s *clientSlot) release() {
+	if s == nil {
+		return
+	}
+	if s.manager != nil {
+		s.manager.release(s)
+		return
+	}
 	s.openUsage.Add(-1)
 }
 
@@ -58,11 +66,7 @@ type xmuxManager struct {
 	clients []*clientSlot
 }
 
-func (m *xmuxManager) acquire() (*clientSlot, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	now := time.Now()
+func (m *xmuxManager) compactLocked(now time.Time) {
 	j := 0
 	for _, slot := range m.clients {
 		if slot.shouldDrop(now) && slot.openUsage.Load() == 0 {
@@ -73,6 +77,14 @@ func (m *xmuxManager) acquire() (*clientSlot, error) {
 		j++
 	}
 	m.clients = m.clients[:j]
+}
+
+func (m *xmuxManager) acquire() (*clientSlot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	m.compactLocked(now)
 
 	var candidate *clientSlot
 	for _, slot := range m.clients {
@@ -89,6 +101,7 @@ func (m *xmuxManager) acquire() (*clientSlot, error) {
 			if err != nil {
 				return nil, err
 			}
+			slot.manager = m
 			m.clients = append(m.clients, slot)
 			candidate = slot
 		} else if len(m.clients) > 0 {
@@ -108,6 +121,21 @@ func (m *xmuxManager) acquire() (*clientSlot, error) {
 		candidate.remainingRequest--
 	}
 	return candidate, nil
+}
+
+func (m *xmuxManager) release(slot *clientSlot) {
+	if slot == nil {
+		return
+	}
+
+	remaining := slot.openUsage.Add(-1)
+	if remaining != 0 {
+		return
+	}
+
+	m.mu.Lock()
+	m.compactLocked(time.Now())
+	m.mu.Unlock()
 }
 
 var xmuxRegistry sync.Map

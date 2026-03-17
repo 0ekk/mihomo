@@ -141,7 +141,8 @@ func TestGetOrCreateSession(t *testing.T) {
 	cfg := &Config{}
 	cfg.normalize()
 	handler := &requestHandler{
-		config: cfg,
+		config:      cfg,
+		idleTimeout: DefaultSessionIdleTimeout,
 	}
 
 	sessionID := uuid.Must(uuid.NewV4()).String()
@@ -172,6 +173,38 @@ func TestGetOrCreateSession(t *testing.T) {
 	}
 	if session1 == session3 {
 		t.Error("Expected different session for different ID")
+	}
+}
+
+func TestCleanupExpiredSessions(t *testing.T) {
+	cfg := &Config{}
+	cfg.normalize()
+	handler := &requestHandler{
+		config:      cfg,
+		idleTimeout: 50 * time.Millisecond,
+	}
+
+	expiredID := uuid.Must(uuid.NewV4()).String()
+	activeID := uuid.Must(uuid.NewV4()).String()
+
+	expiredSession := newHTTPSession(expiredID, DefaultMaxPackets)
+	expiredSession.expiry = time.Now().Add(-time.Second)
+	handler.sessions.Store(expiredID, expiredSession)
+
+	activeSession := newHTTPSession(activeID, DefaultMaxPackets)
+	activeSession.touch(2 * time.Second)
+	handler.sessions.Store(activeID, activeSession)
+
+	handler.cleanupExpiredSessions(time.Now())
+
+	if _, ok := handler.sessions.Load(expiredID); ok {
+		t.Fatal("expired session should be removed")
+	}
+	if !expiredSession.closed.Load() {
+		t.Fatal("expired session should be closed")
+	}
+	if _, ok := handler.sessions.Load(activeID); !ok {
+		t.Fatal("active session should remain")
 	}
 }
 

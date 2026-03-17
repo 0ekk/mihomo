@@ -162,6 +162,17 @@ func newHTTPSession(sessionId string, maxPackets int) *httpSession {
 	}
 }
 
+func (s *httpSession) touch(timeout time.Duration) {
+	if timeout <= 0 {
+		return
+	}
+	s.mu.Lock()
+	if !s.closed.Load() {
+		s.expiry = time.Now().Add(timeout)
+	}
+	s.mu.Unlock()
+}
+
 func (s *httpSession) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -185,6 +196,7 @@ func (s *httpSession) close() error {
 			close(s.downloadQueue)
 		}()
 	}
+	s.expiry = time.Now()
 
 	if s.proxyConn != nil {
 		s.proxyConn.Close()

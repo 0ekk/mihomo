@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -68,6 +69,30 @@ func TestSplitConnClose(t *testing.T) {
 
 	if !closed {
 		t.Error("onClose() hook not called")
+	}
+}
+
+func TestSplitConnCloseOnCloseOnlyOnce(t *testing.T) {
+	pr, pw := io.Pipe()
+	var called atomic.Int32
+
+	conn := &splitConn{
+		reader: pr,
+		writer: pw,
+		onClose: func() {
+			called.Add(1)
+		},
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+
+	if got := called.Load(); got != 1 {
+		t.Fatalf("onClose called %d times, want 1", got)
 	}
 }
 

@@ -3,6 +3,7 @@ package xhttp
 import (
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -12,6 +13,8 @@ type splitConn struct {
 	remote  net.Addr
 	local   net.Addr
 	onClose func()
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (c *splitConn) Read(b []byte) (int, error) {
@@ -23,15 +26,19 @@ func (c *splitConn) Write(b []byte) (int, error) {
 }
 
 func (c *splitConn) Close() error {
-	if c.onClose != nil {
-		c.onClose()
-	}
-	err := c.writer.Close()
-	err2 := c.reader.Close()
-	if err != nil {
-		return err
-	}
-	return err2
+	c.closeOnce.Do(func() {
+		if c.onClose != nil {
+			c.onClose()
+		}
+		err := c.writer.Close()
+		err2 := c.reader.Close()
+		if err != nil {
+			c.closeErr = err
+			return
+		}
+		c.closeErr = err2
+	})
+	return c.closeErr
 }
 
 func (c *splitConn) LocalAddr() net.Addr  { return c.local }
