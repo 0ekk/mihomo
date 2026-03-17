@@ -245,9 +245,10 @@ func dialStreamOne(ctx context.Context, cancel context.CancelFunc, ep *endpoint)
 }
 
 func dialStreamUp(ctx context.Context, cancel context.CancelFunc, uploadEP, downloadEP *endpoint) (net.Conn, error) {
-	downloadCtx := withoutCancel(ctx)
+	downloadCtx, cancelDownload := context.WithCancel(withoutCancel(ctx))
 	downloadReq, err := http.NewRequestWithContext(downloadCtx, http.MethodGet, downloadEP.url.String(), nil)
 	if err != nil {
+		cancelDownload()
 		return nil, err
 	}
 	applyHeaders(downloadReq, downloadEP.cfg, downloadEP.url)
@@ -257,15 +258,18 @@ func dialStreamUp(ctx context.Context, cancel context.CancelFunc, uploadEP, down
 
 	downloadResp, remoteAddr, localAddr, err := doRequest(downloadEP.client, downloadReq)
 	if err != nil {
+		cancelDownload()
 		return nil, err
 	}
 
 	// For upload to ensure it can complete even if the parent
 	// context is cancelled (e.g. during graceful shutdown)
-	uploadCtx := withoutCancel(ctx)
+	uploadCtx, cancelUpload := context.WithCancel(withoutCancel(ctx))
 	pr, pw := io.Pipe()
 	uploadReq, err := http.NewRequestWithContext(uploadCtx, http.MethodPost, uploadEP.url.String(), pr)
 	if err != nil {
+		cancelUpload()
+		cancelDownload()
 		_ = downloadResp.Body.Close()
 		return nil, err
 	}
@@ -277,6 +281,7 @@ func dialStreamUp(ctx context.Context, cancel context.CancelFunc, uploadEP, down
 	uploadDone := make(chan error, 1)
 
 	go func() {
+		defer cancelUpload()
 		resp, err := uploadEP.client.Do(uploadReq)
 		if err != nil {
 			_ = downloadResp.Body.Close()
@@ -297,6 +302,8 @@ func dialStreamUp(ctx context.Context, cancel context.CancelFunc, uploadEP, down
 		local:  localAddr,
 		onClose: func() {
 			cancel()
+			cancelUpload()
+			cancelDownload()
 			_ = pw.Close()
 			_ = downloadResp.Body.Close()
 			select {

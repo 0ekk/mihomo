@@ -8,6 +8,19 @@ import (
 	"github.com/metacubex/http"
 )
 
+type mockRoundTripperCloser struct {
+	closed bool
+}
+
+func (m *mockRoundTripperCloser) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (m *mockRoundTripperCloser) Close() error {
+	m.closed = true
+	return nil
+}
+
 func TestClientSlotShouldDrop(t *testing.T) {
 	now := time.Now()
 
@@ -243,6 +256,36 @@ func TestXmuxManagerCleansExpired(t *testing.T) {
 
 	if len(manager.clients) != 1 {
 		t.Errorf("manager has %d clients after cleanup, want 1", len(manager.clients))
+	}
+}
+
+func TestXmuxManagerReleaseCleansExpired(t *testing.T) {
+	transport := &mockRoundTripperCloser{}
+	manager := &xmuxManager{
+		cfg: normalizedXmux{maxConcurrency: 10, maxConnections: 10},
+	}
+
+	slot := &clientSlot{
+		client:           &http.Client{Transport: transport},
+		transport:        transport,
+		manager:          manager,
+		expiry:           time.Now().Add(-time.Minute),
+		remainingUses:    10,
+		remainingRequest: 10,
+	}
+	slot.openUsage.Store(1)
+	manager.clients = []*clientSlot{slot}
+
+	slot.release()
+
+	if got := slot.openUsage.Load(); got != 0 {
+		t.Fatalf("openUsage = %d, want 0", got)
+	}
+	if len(manager.clients) != 0 {
+		t.Fatalf("manager has %d clients after release cleanup, want 0", len(manager.clients))
+	}
+	if !transport.closed {
+		t.Fatal("expected transport to be closed when expired slot is released")
 	}
 }
 
