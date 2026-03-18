@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/metacubex/http"
+	"github.com/metacubex/mihomo/transport/gun"
+	http3 "github.com/metacubex/quic-go/http3"
 )
 
 type clientSlot struct {
@@ -16,6 +18,7 @@ type clientSlot struct {
 	cfg              normalizedXmux
 	openUsage        atomic.Int32
 	lastTrafficUnix  atomic.Int64
+	draining         atomic.Bool
 	closeOnce        sync.Once
 }
 
@@ -34,9 +37,22 @@ func (s *clientSlot) shouldDrop(now time.Time) bool {
 	return false
 }
 
+func (s *clientSlot) shouldHardDrop(now time.Time) bool {
+	last := s.lastTrafficUnix.Load()
+	if last == 0 {
+		return false
+	}
+	hardTimeout := resolveClientSlotHardIdleTimeout(s.cfg)
+	if hardTimeout <= 0 {
+		return false
+	}
+	return now.Sub(time.Unix(0, last)) >= hardTimeout
+}
+
 func (s *clientSlot) markTraffic() {
 	if s != nil {
 		s.lastTrafficUnix.Store(time.Now().UnixNano())
+		s.draining.Store(false)
 	}
 }
 
@@ -56,12 +72,28 @@ func (s *clientSlot) close() {
 		if s.client != nil {
 			s.client.CloseIdleConnections()
 		}
-		if s.transport != nil {
-			if closer, ok := s.transport.(interface{ Close() error }); ok {
-				_ = closer.Close()
-			}
-		}
+		forceCloseRoundTripper(s.transport)
 	})
+}
+
+func forceCloseRoundTripper(transport http.RoundTripper) {
+	if transport == nil {
+		return
+	}
+	if closer, ok := transport.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+	switch tr := transport.(type) {
+	case *http.Http2Transport:
+		gun.CloseTransport(tr)
+		return
+	case *http3.Transport:
+		_ = tr.Close()
+		return
+	}
+	if closer, ok := transport.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	}
 }
 
 func resolveClientSlotIdleTimeout(cfg normalizedXmux) time.Duration {
@@ -73,6 +105,54 @@ func resolveClientSlotIdleTimeout(cfg normalizedXmux) time.Duration {
 		return idle
 	}
 	return DefaultSessionIdleTimeout
+}
+
+func resolveClientSlotHardIdleTimeout(cfg normalizedXmux) time.Duration {
+	soft := resolveClientSlotIdleTimeout(cfg)
+	if soft <= 0 {
+		return 0
+	}
+	hard := soft * 3
+	if hard < 2*time.Minute {
+		hard = 2 * time.Minute
+	}
+	return hard
+}
+
+func resolveMinWarmSlots(cfg normalizedXmux) int {
+	if cfg.maxConnections == 1 {
+		return 0
+	}
+	if cfg.maxConnections > 0 && cfg.maxConnections < 3 {
+		return 0
+	}
+	return 1
+}
+
+const xmuxJanitorInterval = 20 * time.Second
+
+var xmuxJanitorOnce sync.Once
+
+func startXmuxJanitor() {
+	xmuxJanitorOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(xmuxJanitorInterval)
+			defer ticker.Stop()
+			for now := range ticker.C {
+				xmuxRegistry.Range(func(_, value any) bool {
+					manager, ok := value.(*xmuxManager)
+					if !ok || manager == nil {
+						return true
+					}
+					manager.mu.Lock()
+					manager.compactLocked(now)
+					manager.pruneFromRegistryIfEmptyLocked()
+					manager.mu.Unlock()
+					return true
+				})
+			}
+		}()
+	})
 }
 
 type xmuxManager struct {
@@ -91,12 +171,40 @@ func (m *xmuxManager) pruneFromRegistryIfEmptyLocked() {
 }
 
 func (m *xmuxManager) compactLocked(now time.Time) {
+	if len(m.clients) == 0 {
+		return
+	}
+
+	minWarm := resolveMinWarmSlots(m.cfg)
+	warmCount := 0
+	for _, slot := range m.clients {
+		if !slot.draining.Load() {
+			warmCount++
+		}
+	}
+
 	j := 0
 	for _, slot := range m.clients {
-		if slot.shouldDrop(now) && slot.openUsage.Load() == 0 {
+		usage := slot.openUsage.Load()
+
+		if slot.shouldHardDrop(now) && usage == 0 {
+			if !slot.draining.Load() && warmCount > 0 {
+				warmCount--
+			}
 			slot.close()
 			continue
 		}
+
+		if slot.shouldDrop(now) && !slot.draining.Load() && warmCount > minWarm {
+			slot.draining.Store(true)
+			warmCount--
+		}
+
+		if slot.draining.Load() && usage == 0 {
+			slot.close()
+			continue
+		}
+
 		m.clients[j] = slot
 		j++
 	}
@@ -111,16 +219,24 @@ func (m *xmuxManager) acquire() (*clientSlot, error) {
 	m.compactLocked(now)
 
 	var candidate *clientSlot
-	eligible := make([]*clientSlot, 0, len(m.clients))
+	warmEligible := make([]*clientSlot, 0, len(m.clients))
+	drainingEligible := make([]*clientSlot, 0, len(m.clients))
 	for _, slot := range m.clients {
 		if m.cfg.maxConcurrency > 0 && slot.openUsage.Load() >= m.cfg.maxConcurrency {
 			continue
 		}
-		eligible = append(eligible, slot)
+		if slot.draining.Load() {
+			drainingEligible = append(drainingEligible, slot)
+			continue
+		}
+		warmEligible = append(warmEligible, slot)
 	}
 
-	if len(eligible) > 0 {
-		candidate = eligible[rand.Intn(len(eligible))]
+	if len(warmEligible) > 0 {
+		candidate = warmEligible[rand.Intn(len(warmEligible))]
+	} else if len(drainingEligible) > 0 {
+		candidate = drainingEligible[rand.Intn(len(drainingEligible))]
+		candidate.draining.Store(false)
 	}
 
 	if candidate == nil {
@@ -165,6 +281,8 @@ func (m *xmuxManager) release(slot *clientSlot) {
 var xmuxRegistry sync.Map
 
 func acquireClient(key string, cfg normalizedXmux, factory func() (*clientSlot, error)) (*clientSlot, error) {
+	startXmuxJanitor()
+
 	managerAny, ok := xmuxRegistry.Load(key)
 	if !ok {
 		manager := &xmuxManager{

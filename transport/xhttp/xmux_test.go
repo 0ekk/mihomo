@@ -227,7 +227,7 @@ func TestXmuxManagerReleaseCleansIdle(t *testing.T) {
 	transport := &mockRoundTripperCloser{}
 	manager := &xmuxManager{
 		key: "release-cleans-idle",
-		cfg: normalizedXmux{maxConcurrency: 10, maxConnections: 10, keepAlive: time.Second},
+		cfg: normalizedXmux{maxConcurrency: 10, maxConnections: 1, keepAlive: time.Second},
 	}
 	xmuxRegistry.Store(manager.key, manager)
 	defer xmuxRegistry.Delete(manager.key)
@@ -236,7 +236,7 @@ func TestXmuxManagerReleaseCleansIdle(t *testing.T) {
 		client:    &http.Client{Transport: transport},
 		transport: transport,
 		manager:   manager,
-		cfg:       normalizedXmux{keepAlive: time.Second},
+		cfg:       normalizedXmux{keepAlive: time.Second, maxConnections: 1},
 	}
 	slot.openUsage.Store(1)
 	slot.lastTrafficUnix.Store(time.Now().Add(-40 * time.Second).UnixNano())
@@ -255,6 +255,51 @@ func TestXmuxManagerReleaseCleansIdle(t *testing.T) {
 	}
 	if _, ok := xmuxRegistry.Load(manager.key); ok {
 		t.Fatal("expected empty manager to be pruned from xmuxRegistry")
+	}
+}
+
+func TestXmuxManagerKeepsOneWarmSlot(t *testing.T) {
+	now := time.Now()
+	manager := &xmuxManager{
+		cfg: normalizedXmux{maxConcurrency: 10, maxConnections: 10, keepAlive: time.Second},
+		clients: []*clientSlot{
+			{client: &http.Client{}, cfg: normalizedXmux{keepAlive: time.Second}},
+		},
+	}
+	manager.clients[0].lastTrafficUnix.Store(now.Add(-40 * time.Second).UnixNano())
+
+	manager.mu.Lock()
+	manager.compactLocked(now)
+	manager.mu.Unlock()
+
+	if len(manager.clients) != 1 {
+		t.Fatalf("manager has %d clients, want 1 warm slot retained", len(manager.clients))
+	}
+	if manager.clients[0].draining.Load() {
+		t.Fatal("single warm slot should not enter draining state")
+	}
+}
+
+func TestXmuxManagerHardDropRemovesIdleWarmSlot(t *testing.T) {
+	now := time.Now()
+	transport := &mockRoundTripperCloser{}
+	manager := &xmuxManager{
+		cfg: normalizedXmux{maxConcurrency: 10, maxConnections: 10, keepAlive: time.Second},
+		clients: []*clientSlot{
+			{client: &http.Client{Transport: transport}, transport: transport, cfg: normalizedXmux{keepAlive: time.Second}},
+		},
+	}
+	manager.clients[0].lastTrafficUnix.Store(now.Add(-3 * time.Minute).UnixNano())
+
+	manager.mu.Lock()
+	manager.compactLocked(now)
+	manager.mu.Unlock()
+
+	if len(manager.clients) != 0 {
+		t.Fatalf("manager has %d clients, want hard-dropped to 0", len(manager.clients))
+	}
+	if !transport.closed {
+		t.Fatal("expected transport to be closed on hard drop")
 	}
 }
 
