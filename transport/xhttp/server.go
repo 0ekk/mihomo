@@ -28,6 +28,18 @@ type requestHandler struct {
 	tunnel    C.Tunnel
 	additions []inbound.Addition
 	idleTimeout time.Duration
+	connectedIdleTimeout time.Duration
+}
+
+func deriveConnectedIdleTimeout(idleTimeout time.Duration) time.Duration {
+	if idleTimeout <= 0 {
+		return DefaultConnectedSessionIdleTimeout
+	}
+	connectedTimeout := idleTimeout * 3
+	if connectedTimeout < DefaultConnectedSessionIdleTimeout {
+		connectedTimeout = DefaultConnectedSessionIdleTimeout
+	}
+	return connectedTimeout
 }
 
 type streamUploadConn struct {
@@ -154,6 +166,7 @@ func (h *requestHandler) parseSeq(path string) (uint64, error) {
 func (h *requestHandler) getOrCreateSession(sessionId string) (*httpSession, error) {
 	if val, ok := h.sessions.Load(sessionId); ok {
 		session := val.(*httpSession)
+		session.setIdleTimeouts(h.idleTimeout, h.connectedIdleTimeout)
 		session.touch(h.idleTimeout)
 		return session, nil
 	}
@@ -164,9 +177,11 @@ func (h *requestHandler) getOrCreateSession(sessionId string) (*httpSession, err
 	}
 
 	session := newHTTPSession(sessionId, maxPackets)
+	session.setIdleTimeouts(h.idleTimeout, h.connectedIdleTimeout)
 	session.touch(h.idleTimeout)
 	actual, _ := h.sessions.LoadOrStore(sessionId, session)
 	loaded := actual.(*httpSession)
+	loaded.setIdleTimeouts(h.idleTimeout, h.connectedIdleTimeout)
 	loaded.touch(h.idleTimeout)
 	return loaded, nil
 }
@@ -259,6 +274,7 @@ func (h *requestHandler) handleDownload(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+	session.markFullyConnected()
 	session.touch(h.idleTimeout)
 
 	h.applyResponseHeaders(w)
@@ -463,6 +479,7 @@ func NewHTTP1Server(config *Config, tunnel C.Tunnel, additions []inbound.Additio
 		tunnel:    tunnel,
 		additions: additions,
 		idleTimeout: DefaultSessionIdleTimeout,
+		connectedIdleTimeout: deriveConnectedIdleTimeout(DefaultSessionIdleTimeout),
 	}
 	return &http.Server{
 		Handler: handler,
@@ -484,6 +501,7 @@ func NewHTTP2Server(config *Config, tunnel C.Tunnel, additions []inbound.Additio
 		tunnel:    tunnel,
 		additions: additions,
 		idleTimeout: DefaultSessionIdleTimeout,
+		connectedIdleTimeout: deriveConnectedIdleTimeout(DefaultSessionIdleTimeout),
 	}
 	srv := &http.Server{
 		Handler:   handler,
@@ -515,6 +533,7 @@ func NewHTTP3Server(config *Config, tunnel C.Tunnel, additions []inbound.Additio
 		tunnel:    tunnel,
 		additions: additions,
 		idleTimeout: DefaultSessionIdleTimeout,
+		connectedIdleTimeout: deriveConnectedIdleTimeout(DefaultSessionIdleTimeout),
 	}
 	quicCfg := &quic.Config{
 		MaxIdleTimeout: 60 * 1000000000,
@@ -543,6 +562,7 @@ func NewServer(ctx context.Context, config *Config, tunnel C.Tunnel, additions [
 		tunnel:      tunnel,
 		additions:   additions,
 		idleTimeout: DefaultSessionIdleTimeout,
+		connectedIdleTimeout: deriveConnectedIdleTimeout(DefaultSessionIdleTimeout),
 	}
 
 	switch httpVersion {

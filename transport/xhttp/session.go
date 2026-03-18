@@ -66,11 +66,20 @@ func (uq *uploadQueue) Push(packet Packet) error {
 	if uq.closed.Load() {
 		return io.ErrClosedPipe
 	}
+	timer := time.NewTimer(DefaultEnqueueTimeout)
+	defer timer.Stop()
 	select {
 	case uq.pushedPackets <- packet:
 		return nil
-	default:
+	case <-timer.C:
 		return io.ErrShortBuffer
+	default:
+		select {
+		case uq.pushedPackets <- packet:
+			return nil
+		case <-timer.C:
+			return io.ErrShortBuffer
+		}
 	}
 }
 
@@ -148,7 +157,10 @@ type httpSession struct {
 	mode          string
 	created       time.Time
 	expiry        time.Time
+	idleTimeout   time.Duration
+	connectedIdleTimeout time.Duration
 	closed        atomic.Bool
+	isFullyConnected atomic.Bool
 	tunnelStarted atomic.Bool
 	mu            sync.Mutex
 }
@@ -159,10 +171,34 @@ func newHTTPSession(sessionId string, maxPackets int) *httpSession {
 		uploadQueue:   newUploadQueue(maxPackets),
 		downloadQueue: make(chan []byte, DefaultPacketChannelSize),
 		created:       time.Now(),
+		idleTimeout:   DefaultSessionIdleTimeout,
+		connectedIdleTimeout: DefaultConnectedSessionIdleTimeout,
 	}
 }
 
+func (s *httpSession) setIdleTimeouts(timeout, connectedTimeout time.Duration) {
+	if timeout <= 0 || connectedTimeout <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.idleTimeout = timeout
+	s.connectedIdleTimeout = connectedTimeout
+	s.mu.Unlock()
+}
+
+func (s *httpSession) markFullyConnected() {
+	s.isFullyConnected.Store(true)
+	s.touch(0)
+}
+
 func (s *httpSession) touch(timeout time.Duration) {
+	if timeout <= 0 {
+		if s.isFullyConnected.Load() {
+			timeout = s.connectedIdleTimeout
+		} else {
+			timeout = s.idleTimeout
+		}
+	}
 	if timeout <= 0 {
 		return
 	}
@@ -252,6 +288,7 @@ func (c *xhttpConn) Read(b []byte) (n int, err error) {
 
 	n, err = c.session.uploadQueue.Read(buf)
 	if n > 0 {
+		c.session.touch(0)
 		copied := copy(b, buf[:n])
 		if copied < n {
 			c.readBuf = make([]byte, n-copied)
@@ -276,9 +313,18 @@ func (c *xhttpConn) Write(b []byte) (n int, err error) {
 
 	select {
 	case c.session.downloadQueue <- data:
+		c.session.touch(0)
 		return len(b), nil
-	default:
+	case <-time.After(DefaultEnqueueTimeout):
 		return 0, io.ErrShortBuffer
+	default:
+		select {
+		case c.session.downloadQueue <- data:
+			c.session.touch(0)
+			return len(b), nil
+		case <-time.After(DefaultEnqueueTimeout):
+			return 0, io.ErrShortBuffer
+		}
 	}
 }
 

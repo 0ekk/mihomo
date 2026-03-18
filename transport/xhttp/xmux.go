@@ -1,6 +1,7 @@
 package xhttp
 
 import (
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,10 +18,14 @@ type clientSlot struct {
 	remainingRequest int32
 	expiry           time.Time
 	openUsage        atomic.Int32
+	unusable        atomic.Bool
 	closeOnce        sync.Once
 }
 
 func (s *clientSlot) shouldDrop(now time.Time) bool {
+	if s.unusable.Load() {
+		return true
+	}
 	if !s.expiry.IsZero() && now.After(s.expiry) {
 		return true
 	}
@@ -31,6 +36,12 @@ func (s *clientSlot) shouldDrop(now time.Time) bool {
 		return true
 	}
 	return false
+}
+
+func (s *clientSlot) markUnusable() {
+	if s != nil {
+		s.unusable.Store(true)
+	}
 }
 
 func (s *clientSlot) release() {
@@ -66,6 +77,12 @@ type xmuxManager struct {
 	clients []*clientSlot
 }
 
+func (m *xmuxManager) pruneFromRegistryIfEmptyLocked() {
+	if len(m.clients) == 0 {
+		xmuxRegistry.Delete(m.key)
+	}
+}
+
 func (m *xmuxManager) compactLocked(now time.Time) {
 	j := 0
 	for _, slot := range m.clients {
@@ -87,12 +104,16 @@ func (m *xmuxManager) acquire() (*clientSlot, error) {
 	m.compactLocked(now)
 
 	var candidate *clientSlot
+	eligible := make([]*clientSlot, 0, len(m.clients))
 	for _, slot := range m.clients {
 		if m.cfg.maxConcurrency > 0 && slot.openUsage.Load() >= m.cfg.maxConcurrency {
 			continue
 		}
-		candidate = slot
-		break
+		eligible = append(eligible, slot)
+	}
+
+	if len(eligible) > 0 {
+		candidate = eligible[rand.Intn(len(eligible))]
 	}
 
 	if candidate == nil {
@@ -135,6 +156,7 @@ func (m *xmuxManager) release(slot *clientSlot) {
 
 	m.mu.Lock()
 	m.compactLocked(time.Now())
+	m.pruneFromRegistryIfEmptyLocked()
 	m.mu.Unlock()
 }
 

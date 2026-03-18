@@ -13,6 +13,8 @@ const (
 const (
 	DefaultPollInterval = 100 * time.Millisecond
 	DefaultMaxPackets   = 30
-	DefaultSessionIdleTimeout    = 2 * time.Minute
+	DefaultSessionIdleTimeout    = 10 * time.Minute
+	DefaultConnectedSessionIdleTimeout = 30 * time.Minute
 	DefaultSessionCleanupInterval = 30 * time.Second
+	DefaultEnqueueTimeout         = 500 * time.Millisecond
 )

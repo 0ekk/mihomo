@@ -262,8 +262,11 @@ func TestXmuxManagerCleansExpired(t *testing.T) {
 func TestXmuxManagerReleaseCleansExpired(t *testing.T) {
 	transport := &mockRoundTripperCloser{}
 	manager := &xmuxManager{
+		key: "release-cleans-expired",
 		cfg: normalizedXmux{maxConcurrency: 10, maxConnections: 10},
 	}
+	xmuxRegistry.Store(manager.key, manager)
+	defer xmuxRegistry.Delete(manager.key)
 
 	slot := &clientSlot{
 		client:           &http.Client{Transport: transport},
@@ -286,6 +289,41 @@ func TestXmuxManagerReleaseCleansExpired(t *testing.T) {
 	}
 	if !transport.closed {
 		t.Fatal("expected transport to be closed when expired slot is released")
+	}
+	if _, ok := xmuxRegistry.Load(manager.key); ok {
+		t.Fatal("expected empty manager to be pruned from xmuxRegistry")
+	}
+}
+
+func TestXmuxManagerReleaseCleansUnusable(t *testing.T) {
+	manager := &xmuxManager{
+		key: "release-cleans-unusable",
+		cfg: normalizedXmux{maxConcurrency: 10, maxConnections: 10},
+	}
+	xmuxRegistry.Store(manager.key, manager)
+	defer xmuxRegistry.Delete(manager.key)
+
+	slot := &clientSlot{
+		client:           &http.Client{},
+		transport:        &mockRoundTripperCloser{},
+		manager:          manager,
+		remainingUses:    10,
+		remainingRequest: 10,
+	}
+	slot.openUsage.Store(1)
+	slot.markUnusable()
+	manager.clients = []*clientSlot{slot}
+
+	slot.release()
+
+	if got := slot.openUsage.Load(); got != 0 {
+		t.Fatalf("openUsage = %d, want 0", got)
+	}
+	if len(manager.clients) != 0 {
+		t.Fatalf("manager has %d clients after release cleanup, want 0", len(manager.clients))
+	}
+	if _, ok := xmuxRegistry.Load(manager.key); ok {
+		t.Fatal("expected empty manager to be pruned from xmuxRegistry")
 	}
 }
 

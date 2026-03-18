@@ -65,6 +65,7 @@ type endpoint struct {
 	url         *url.URL
 	client      *http.Client
 	httpVersion string
+	slot        *clientSlot
 	releaseOnce sync.Once
 	releaseFunc func()
 }
@@ -76,6 +77,12 @@ func (e *endpoint) release() {
 	e.releaseOnce.Do(func() {
 		e.releaseFunc()
 	})
+}
+
+func (e *endpoint) markBroken() {
+	if e != nil && e.slot != nil {
+		e.slot.markUnusable()
+	}
 }
 
 // Dial establishes an XHTTP (SplitHTTP) connection and returns a net.Conn compatible stream.
@@ -209,6 +216,7 @@ func prepareEndpoint(cfg *Config, opts Options, sessionID string, isDownload boo
 		url:         baseURL,
 		client:      slot.client,
 		httpVersion: httpVersion,
+		slot:        slot,
 		releaseFunc: slot.release,
 	}, nil
 }
@@ -258,6 +266,7 @@ func dialStreamUp(ctx context.Context, cancel context.CancelFunc, uploadEP, down
 
 	downloadResp, remoteAddr, localAddr, err := doRequest(downloadEP.client, downloadReq)
 	if err != nil {
+		downloadEP.markBroken()
 		cancelDownload()
 		return nil, err
 	}
@@ -284,6 +293,7 @@ func dialStreamUp(ctx context.Context, cancel context.CancelFunc, uploadEP, down
 		defer cancelUpload()
 		resp, err := uploadEP.client.Do(uploadReq)
 		if err != nil {
+			uploadEP.markBroken()
 			_ = downloadResp.Body.Close()
 			pr.CloseWithError(err)
 			uploadDone <- err
@@ -330,6 +340,7 @@ func dialPacketUp(ctx context.Context, cancel context.CancelFunc, uploadEP, down
 
 	downloadResp, remoteAddr, localAddr, err := doRequest(downloadEP.client, downloadReq)
 	if err != nil {
+		downloadEP.markBroken()
 		return nil, err
 	}
 
@@ -391,6 +402,7 @@ func handleUploads(ctx context.Context, ep *endpoint, reader *io.PipeReader, dow
 			}
 			resp, reqErr := ep.client.Do(req)
 			if reqErr != nil {
+				ep.markBroken()
 				_ = downloadBody.Close()
 				reader.CloseWithError(reqErr)
 				return reqErr
