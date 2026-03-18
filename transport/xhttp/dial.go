@@ -174,7 +174,6 @@ func prepareEndpoint(cfg *Config, opts Options, sessionID string, isDownload boo
 	key := fmt.Sprintf("%s|%s|%s|%s|%t", opts.Address, host, cfg.Path, httpVersion, isDownload)
 
 	slot, err := acquireClient(key, xmuxCfg, func() (*clientSlot, error) {
-		uses, requests, expiry := xmuxCfg.newSlotLimits()
 		client, transport, err := newHTTPClient(httpVersion, func(ctx context.Context, network string) (net.Conn, error) {
 			target := "tcp"
 			if network != "" {
@@ -189,12 +188,9 @@ func prepareEndpoint(cfg *Config, opts Options, sessionID string, isDownload boo
 			return nil, err
 		}
 		return &clientSlot{
-			client:           client,
-			transport:        transport,
-			cfg:              xmuxCfg,
-			remainingUses:    uses,
-			remainingRequest: requests,
-			expiry:           expiry,
+			client:    client,
+			transport: transport,
+			cfg:       xmuxCfg,
 		}, nil
 	})
 	if err != nil {

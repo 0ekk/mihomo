@@ -23,6 +23,7 @@ func (m *mockRoundTripperCloser) Close() error {
 
 func TestClientSlotShouldDrop(t *testing.T) {
 	now := time.Now()
+	idleCfg := normalizedXmux{keepAlive: time.Second}
 
 	tests := []struct {
 		name string
@@ -31,67 +32,41 @@ func TestClientSlotShouldDrop(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "not expired",
+			name: "recent traffic should keep slot",
 			slot: &clientSlot{
-				expiry:           now.Add(time.Hour),
-				remainingUses:    10,
-				remainingRequest: 10,
-				cfg:              normalizedXmux{reuseRange: Range{From: 5, To: 10}, requestRange: Range{From: 5, To: 10}},
+				cfg: idleCfg,
 			},
 			now:  now,
 			want: false,
 		},
 		{
-			name: "expired by time",
+			name: "stale traffic should drop slot",
 			slot: &clientSlot{
-				expiry:           now.Add(-time.Hour),
-				remainingUses:    10,
-				remainingRequest: 10,
+				cfg: idleCfg,
 			},
 			now:  now,
 			want: true,
 		},
 		{
-			name: "zero remaining uses",
+			name: "no traffic record should not drop immediately",
 			slot: &clientSlot{
-				remainingUses:    0,
-				remainingRequest: 10,
-				cfg:              normalizedXmux{reuseRange: Range{From: 5, To: 10}},
+				cfg: idleCfg,
 			},
 			now:  now,
-			want: true,
-		},
-		{
-			name: "zero remaining requests",
-			slot: &clientSlot{
-				remainingUses:    10,
-				remainingRequest: 0,
-				cfg:              normalizedXmux{requestRange: Range{From: 5, To: 10}},
-			},
-			now:  now,
-			want: true,
-		},
-		{
-			name: "zero expiry never expires",
-			slot: &clientSlot{
-				expiry:           time.Time{},
-				remainingUses:    10,
-				remainingRequest: 10,
-			},
-			now:  now.Add(time.Hour * 1000),
 			want: false,
 		},
 		{
-			name: "zero uses with no range",
+			name: "keepAlive zero falls back and should not drop",
 			slot: &clientSlot{
-				remainingUses:    0,
-				remainingRequest: 10,
-				cfg:              normalizedXmux{},
+				cfg: normalizedXmux{},
 			},
-			now:  now,
+			now:  now.Add(time.Second),
 			want: false,
 		},
 	}
+
+	tests[0].slot.lastTrafficUnix.Store(now.UnixNano())
+	tests[1].slot.lastTrafficUnix.Store(now.Add(-40 * time.Second).UnixNano())
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -130,9 +105,7 @@ func TestXmuxManagerAcquireCreatesNew(t *testing.T) {
 		newClient: func() (*clientSlot, error) {
 			callCount++
 			return &clientSlot{
-				client:           &http.Client{},
-				remainingUses:    10,
-				remainingRequest: 10,
+				client: &http.Client{},
 			}, nil
 		},
 	}
@@ -159,9 +132,7 @@ func TestXmuxManagerAcquireReusesExisting(t *testing.T) {
 		newClient: func() (*clientSlot, error) {
 			callCount++
 			return &clientSlot{
-				client:           &http.Client{},
-				remainingUses:    10,
-				remainingRequest: 10,
+				client: &http.Client{},
 			}, nil
 		},
 	}
@@ -187,9 +158,7 @@ func TestXmuxManagerAcquireRespectsMaxConcurrency(t *testing.T) {
 		cfg: normalizedXmux{maxConcurrency: 1, maxConnections: 5},
 		newClient: func() (*clientSlot, error) {
 			return &clientSlot{
-				client:           &http.Client{},
-				remainingUses:    100,
-				remainingRequest: 100,
+				client: &http.Client{},
 			}, nil
 		},
 	}
@@ -213,9 +182,7 @@ func TestXmuxManagerAcquireRespectsMaxConnections(t *testing.T) {
 		newClient: func() (*clientSlot, error) {
 			callCount++
 			slot := &clientSlot{
-				client:           &http.Client{},
-				remainingUses:    100,
-				remainingRequest: 100,
+				client: &http.Client{},
 			}
 			slot.openUsage.Store(1)
 			return slot, nil
@@ -235,17 +202,14 @@ func TestXmuxManagerAcquireRespectsMaxConnections(t *testing.T) {
 	}
 }
 
-func TestXmuxManagerCleansExpired(t *testing.T) {
+func TestXmuxManagerCleansIdle(t *testing.T) {
 	now := time.Now()
 	manager := &xmuxManager{
-		cfg: normalizedXmux{maxConcurrency: 10, maxConnections: 10},
+		cfg: normalizedXmux{maxConcurrency: 10, maxConnections: 10, keepAlive: time.Second},
 		newClient: func() (*clientSlot, error) {
-			return &clientSlot{
-				client:           &http.Client{},
-				remainingUses:    10,
-				remainingRequest: 10,
-				expiry:           now.Add(-time.Hour),
-			}, nil
+			slot := &clientSlot{client: &http.Client{}, cfg: normalizedXmux{keepAlive: time.Second}}
+			slot.lastTrafficUnix.Store(now.Add(-40 * time.Second).UnixNano())
+			return slot, nil
 		},
 	}
 
@@ -259,21 +223,23 @@ func TestXmuxManagerCleansExpired(t *testing.T) {
 	}
 }
 
-func TestXmuxManagerReleaseCleansExpired(t *testing.T) {
+func TestXmuxManagerReleaseCleansIdle(t *testing.T) {
 	transport := &mockRoundTripperCloser{}
 	manager := &xmuxManager{
-		cfg: normalizedXmux{maxConcurrency: 10, maxConnections: 10},
+		key: "release-cleans-idle",
+		cfg: normalizedXmux{maxConcurrency: 10, maxConnections: 10, keepAlive: time.Second},
 	}
+	xmuxRegistry.Store(manager.key, manager)
+	defer xmuxRegistry.Delete(manager.key)
 
 	slot := &clientSlot{
-		client:           &http.Client{Transport: transport},
-		transport:        transport,
-		manager:          manager,
-		expiry:           time.Now().Add(-time.Minute),
-		remainingUses:    10,
-		remainingRequest: 10,
+		client:    &http.Client{Transport: transport},
+		transport: transport,
+		manager:   manager,
+		cfg:       normalizedXmux{keepAlive: time.Second},
 	}
 	slot.openUsage.Store(1)
+	slot.lastTrafficUnix.Store(time.Now().Add(-40 * time.Second).UnixNano())
 	manager.clients = []*clientSlot{slot}
 
 	slot.release()
@@ -285,18 +251,19 @@ func TestXmuxManagerReleaseCleansExpired(t *testing.T) {
 		t.Fatalf("manager has %d clients after release cleanup, want 0", len(manager.clients))
 	}
 	if !transport.closed {
-		t.Fatal("expected transport to be closed when expired slot is released")
+		t.Fatal("expected transport to be closed when idle slot is released")
+	}
+	if _, ok := xmuxRegistry.Load(manager.key); ok {
+		t.Fatal("expected empty manager to be pruned from xmuxRegistry")
 	}
 }
 
-func TestXmuxManagerDecrementsCounters(t *testing.T) {
+func TestXmuxManagerMarksTrafficOnAcquire(t *testing.T) {
 	manager := &xmuxManager{
 		cfg: normalizedXmux{maxConcurrency: 10, maxConnections: 10},
 		newClient: func() (*clientSlot, error) {
 			return &clientSlot{
-				client:           &http.Client{},
-				remainingUses:    5,
-				remainingRequest: 10,
+				client: &http.Client{},
 			}, nil
 		},
 	}
@@ -306,11 +273,8 @@ func TestXmuxManagerDecrementsCounters(t *testing.T) {
 	if slot.openUsage.Load() != 1 {
 		t.Errorf("openUsage = %d, want 1", slot.openUsage.Load())
 	}
-	if slot.remainingUses != 4 {
-		t.Errorf("remainingUses = %d, want 4", slot.remainingUses)
-	}
-	if slot.remainingRequest != 9 {
-		t.Errorf("remainingRequest = %d, want 9", slot.remainingRequest)
+	if slot.lastTrafficUnix.Load() == 0 {
+		t.Fatal("lastTrafficUnix should be set on acquire")
 	}
 }
 
@@ -319,9 +283,7 @@ func TestXmuxManagerConcurrentAccess(t *testing.T) {
 		cfg: normalizedXmux{maxConcurrency: 5, maxConnections: 10},
 		newClient: func() (*clientSlot, error) {
 			return &clientSlot{
-				client:           &http.Client{},
-				remainingUses:    1000,
-				remainingRequest: 1000,
+				client: &http.Client{},
 			}, nil
 		},
 	}
@@ -353,9 +315,7 @@ func TestAcquireClientCreatesManager(t *testing.T) {
 
 	slot, err := acquireClient(key, cfg, func() (*clientSlot, error) {
 		return &clientSlot{
-			client:           &http.Client{},
-			remainingUses:    10,
-			remainingRequest: 10,
+			client: &http.Client{},
 		}, nil
 	})
 
@@ -377,9 +337,7 @@ func TestAcquireClientReusesManager(t *testing.T) {
 	factory := func() (*clientSlot, error) {
 		callCount++
 		return &clientSlot{
-			client:           &http.Client{},
-			remainingUses:    10,
-			remainingRequest: 10,
+			client: &http.Client{},
 		}, nil
 	}
 

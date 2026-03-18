@@ -1,6 +1,7 @@
 package xhttp
 
 import (
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,24 +14,30 @@ type clientSlot struct {
 	transport        http.RoundTripper
 	manager          *xmuxManager
 	cfg              normalizedXmux
-	remainingUses    int32
-	remainingRequest int32
-	expiry           time.Time
 	openUsage        atomic.Int32
+	lastTrafficUnix  atomic.Int64
 	closeOnce        sync.Once
 }
 
 func (s *clientSlot) shouldDrop(now time.Time) bool {
-	if !s.expiry.IsZero() && now.After(s.expiry) {
-		return true
+	last := s.lastTrafficUnix.Load()
+	if last == 0 {
+		return false
 	}
-	if s.remainingUses == 0 && s.cfg.reuseRange != (Range{}) {
-		return true
+	idleTimeout := resolveClientSlotIdleTimeout(s.cfg)
+	if idleTimeout <= 0 {
+		return false
 	}
-	if s.remainingRequest == 0 && s.cfg.requestRange != (Range{}) {
+	if now.Sub(time.Unix(0, last)) >= idleTimeout {
 		return true
 	}
 	return false
+}
+
+func (s *clientSlot) markTraffic() {
+	if s != nil {
+		s.lastTrafficUnix.Store(time.Now().UnixNano())
+	}
 }
 
 func (s *clientSlot) release() {
@@ -46,15 +53,26 @@ func (s *clientSlot) release() {
 
 func (s *clientSlot) close() {
 	s.closeOnce.Do(func() {
+		if s.client != nil {
+			s.client.CloseIdleConnections()
+		}
 		if s.transport != nil {
 			if closer, ok := s.transport.(interface{ Close() error }); ok {
 				_ = closer.Close()
 			}
 		}
-		if s.client != nil {
-			s.client.CloseIdleConnections()
-		}
 	})
+}
+
+func resolveClientSlotIdleTimeout(cfg normalizedXmux) time.Duration {
+	if cfg.keepAlive > 0 {
+		idle := cfg.keepAlive * 4
+		if idle < 30*time.Second {
+			idle = 30 * time.Second
+		}
+		return idle
+	}
+	return DefaultSessionIdleTimeout
 }
 
 type xmuxManager struct {
@@ -64,6 +82,12 @@ type xmuxManager struct {
 
 	mu      sync.Mutex
 	clients []*clientSlot
+}
+
+func (m *xmuxManager) pruneFromRegistryIfEmptyLocked() {
+	if len(m.clients) == 0 {
+		xmuxRegistry.Delete(m.key)
+	}
 }
 
 func (m *xmuxManager) compactLocked(now time.Time) {
@@ -87,12 +111,16 @@ func (m *xmuxManager) acquire() (*clientSlot, error) {
 	m.compactLocked(now)
 
 	var candidate *clientSlot
+	eligible := make([]*clientSlot, 0, len(m.clients))
 	for _, slot := range m.clients {
 		if m.cfg.maxConcurrency > 0 && slot.openUsage.Load() >= m.cfg.maxConcurrency {
 			continue
 		}
-		candidate = slot
-		break
+		eligible = append(eligible, slot)
+	}
+
+	if len(eligible) > 0 {
+		candidate = eligible[rand.Intn(len(eligible))]
 	}
 
 	if candidate == nil {
@@ -113,13 +141,8 @@ func (m *xmuxManager) acquire() (*clientSlot, error) {
 		return nil, nil
 	}
 
+	candidate.markTraffic()
 	candidate.openUsage.Add(1)
-	if candidate.remainingUses > 0 {
-		candidate.remainingUses--
-	}
-	if candidate.remainingRequest > 0 {
-		candidate.remainingRequest--
-	}
 	return candidate, nil
 }
 
@@ -134,8 +157,9 @@ func (m *xmuxManager) release(slot *clientSlot) {
 	}
 
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.compactLocked(time.Now())
-	m.mu.Unlock()
+	m.pruneFromRegistryIfEmptyLocked()
 }
 
 var xmuxRegistry sync.Map

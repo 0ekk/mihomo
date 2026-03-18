@@ -208,6 +208,55 @@ func TestCleanupExpiredSessions(t *testing.T) {
 	}
 }
 
+func TestCleanupExpiredSessionsReapsFullyConnectedWhenExpired(t *testing.T) {
+	cfg := &Config{}
+	cfg.normalize()
+	handler := &requestHandler{
+		config:      cfg,
+		idleTimeout: 50 * time.Millisecond,
+		connectedIdleTimeout: 200 * time.Millisecond,
+	}
+
+	sessionID := uuid.Must(uuid.NewV4()).String()
+	session := newHTTPSession(sessionID, DefaultMaxPackets)
+	session.expiry = time.Now().Add(-time.Second)
+	session.markFullyConnected()
+	session.expiry = time.Now().Add(-time.Second)
+	handler.sessions.Store(sessionID, session)
+
+	handler.cleanupExpiredSessions(time.Now())
+
+	if _, ok := handler.sessions.Load(sessionID); ok {
+		t.Fatal("expired fully connected session should be reaped by janitor")
+	}
+	if !session.closed.Load() {
+		t.Fatal("expired fully connected session should be closed by janitor")
+	}
+}
+
+func TestSessionTouchUsesConnectedIdleTimeout(t *testing.T) {
+	session := newHTTPSession(uuid.Must(uuid.NewV4()).String(), DefaultMaxPackets)
+	session.setIdleTimeouts(100*time.Millisecond, 400*time.Millisecond)
+
+	session.touch(0)
+	if session.expiry.IsZero() {
+		t.Fatal("expiry should be set for non-connected session")
+	}
+	nonConnectedRemaining := time.Until(session.expiry)
+	if nonConnectedRemaining <= 0 || nonConnectedRemaining > 2*100*time.Millisecond {
+		t.Fatalf("unexpected non-connected timeout window: %v", nonConnectedRemaining)
+	}
+
+	session.markFullyConnected()
+	if session.expiry.IsZero() {
+		t.Fatal("expiry should be set for fully connected session")
+	}
+	connectedRemaining := time.Until(session.expiry)
+	if connectedRemaining <= 2*100*time.Millisecond {
+		t.Fatalf("connected timeout should be longer, got: %v", connectedRemaining)
+	}
+}
+
 func TestHandleStreamUpload(t *testing.T) {
 	cfg := &Config{}
 	cfg.normalize()
