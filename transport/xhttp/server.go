@@ -23,11 +23,11 @@ import (
 )
 
 type requestHandler struct {
-	config    *Config
-	sessions  sync.Map
-	tunnel    C.Tunnel
-	additions []inbound.Addition
-	idleTimeout time.Duration
+	config               *Config
+	sessions             sync.Map
+	tunnel               C.Tunnel
+	additions            []inbound.Addition
+	idleTimeout          time.Duration
 	connectedIdleTimeout time.Duration
 }
 
@@ -86,23 +86,34 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessionID, err := h.parseSessionID(r.URL.Path)
-	if err != nil {
-		log.Debugln("xhttp: invalid session ID: %v", err)
-		http.Error(w, "Not Found", http.StatusNotFound)
-		return
-	}
-
 	if r.Method == http.MethodGet {
+		sessionID, err := h.parseSessionID(r.URL.Path)
+		if err != nil {
+			log.Debugln("xhttp: invalid session ID: %v", err)
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
 		h.handleDownload(w, r, sessionID)
 		return
 	}
 
 	if r.Method == http.MethodPost {
+		if h.isBasePath(r.URL.Path) {
+			sessionID := uuid.Must(uuid.NewV4()).String()
+			h.handleStreamUpload(w, r, sessionID, true)
+			return
+		}
+
+		sessionID, err := h.parseSessionID(r.URL.Path)
+		if err != nil {
+			log.Debugln("xhttp: invalid session ID: %v", err)
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
 		if seq, err := h.parseSeq(r.URL.Path); err == nil {
 			h.handlePacketUpload(w, r, sessionID, seq)
 		} else {
-			h.handleStreamUpload(w, r, sessionID)
+			h.handleStreamUpload(w, r, sessionID, false)
 		}
 		return
 	}
@@ -161,6 +172,12 @@ func (h *requestHandler) parseSeq(path string) (uint64, error) {
 	}
 
 	return seq, nil
+}
+
+func (h *requestHandler) isBasePath(path string) bool {
+	trimmedPath := strings.TrimRight(path, "/")
+	trimmedBase := strings.TrimRight(h.config.Path, "/")
+	return trimmedPath == trimmedBase
 }
 
 func (h *requestHandler) getOrCreateSession(sessionId string) (*httpSession, error) {
@@ -340,17 +357,20 @@ func (h *requestHandler) handleDownload(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
-func (h *requestHandler) handleStreamUpload(w http.ResponseWriter, r *http.Request, sessionID string) {
+func (h *requestHandler) handleStreamUpload(w http.ResponseWriter, r *http.Request, sessionID string, closeWhenDone bool) {
 	session, err := h.getOrCreateSession(sessionID)
 	if err != nil {
 		log.Warnln("xhttp: failed to get session: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+	if closeWhenDone {
+		defer h.closeAndDeleteSession(sessionID, session)
+	}
 	session.touch(h.idleTimeout)
 
 	httpSC := newStreamUploadConn(r.Body, w)
- 	defer httpSC.Close()
+	defer httpSC.Close()
 
 	packet := Packet{
 		Reader: httpSC,
@@ -475,10 +495,10 @@ func NewHTTP1Server(config *Config, tunnel C.Tunnel, additions []inbound.Additio
 		return nil, errors.New("xhttp: config is required")
 	}
 	handler := &requestHandler{
-		config:    config,
-		tunnel:    tunnel,
-		additions: additions,
-		idleTimeout: DefaultSessionIdleTimeout,
+		config:               config,
+		tunnel:               tunnel,
+		additions:            additions,
+		idleTimeout:          DefaultSessionIdleTimeout,
 		connectedIdleTimeout: deriveConnectedIdleTimeout(DefaultSessionIdleTimeout),
 	}
 	return &http.Server{
@@ -497,10 +517,10 @@ func NewHTTP2Server(config *Config, tunnel C.Tunnel, additions []inbound.Additio
 		tlsCfg.NextProtos = []string{"h2", "http/1.1"}
 	}
 	handler := &requestHandler{
-		config:    config,
-		tunnel:    tunnel,
-		additions: additions,
-		idleTimeout: DefaultSessionIdleTimeout,
+		config:               config,
+		tunnel:               tunnel,
+		additions:            additions,
+		idleTimeout:          DefaultSessionIdleTimeout,
 		connectedIdleTimeout: deriveConnectedIdleTimeout(DefaultSessionIdleTimeout),
 	}
 	srv := &http.Server{
@@ -529,10 +549,10 @@ func NewHTTP3Server(config *Config, tunnel C.Tunnel, additions []inbound.Additio
 		tlsCfg.NextProtos = []string{"h3"}
 	}
 	handler := &requestHandler{
-		config:    config,
-		tunnel:    tunnel,
-		additions: additions,
-		idleTimeout: DefaultSessionIdleTimeout,
+		config:               config,
+		tunnel:               tunnel,
+		additions:            additions,
+		idleTimeout:          DefaultSessionIdleTimeout,
 		connectedIdleTimeout: deriveConnectedIdleTimeout(DefaultSessionIdleTimeout),
 	}
 	quicCfg := &quic.Config{
@@ -558,10 +578,10 @@ func NewServer(ctx context.Context, config *Config, tunnel C.Tunnel, additions [
 	config.normalize()
 	httpVersion := config.httpVersion(tlsCfg != nil)
 	handler := &requestHandler{
-		config:      config,
-		tunnel:      tunnel,
-		additions:   additions,
-		idleTimeout: DefaultSessionIdleTimeout,
+		config:               config,
+		tunnel:               tunnel,
+		additions:            additions,
+		idleTimeout:          DefaultSessionIdleTimeout,
 		connectedIdleTimeout: deriveConnectedIdleTimeout(DefaultSessionIdleTimeout),
 	}
 

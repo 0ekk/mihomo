@@ -65,16 +65,37 @@ func TestUploadQueueBufferLimit(t *testing.T) {
 	uq := newUploadQueue(2)
 	defer uq.Close()
 
-	for i := 0; i < 64; i++ {
-		uq.Push(Packet{Payload: []byte("x"), Seq: uint64(i)})
+	if err := uq.Push(Packet{Payload: []byte("0"), Seq: 0}); err != nil {
+		t.Fatalf("push 0 failed: %v", err)
+	}
+	if err := uq.Push(Packet{Payload: []byte("1"), Seq: 1}); err != nil {
+		t.Fatalf("push 1 failed: %v", err)
 	}
 
-	time.Sleep(10 * time.Millisecond)
+	done := make(chan error, 1)
+	go func() {
+		done <- uq.Push(Packet{Payload: []byte("2"), Seq: 2})
+	}()
 
-	for i := 0; i < 10; i++ {
-		if err := uq.Push(Packet{Payload: []byte("overflow"), Seq: uint64(100 + i)}); err != io.ErrShortBuffer {
-			t.Errorf("Expected ErrShortBuffer, got %v", err)
+	select {
+	case err := <-done:
+		t.Fatalf("expected blocking push, got immediate result: %v", err)
+	case <-time.After(80 * time.Millisecond):
+		// expected: blocked by backpressure
+	}
+
+	buf := make([]byte, 100)
+	if _, err := uq.Read(buf); err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("blocked push should succeed after read: %v", err)
 		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting blocked push to complete")
 	}
 }
 
@@ -148,18 +169,15 @@ func TestUploadQueueTimeout(t *testing.T) {
 		done <- err
 	}()
 
-	start := time.Now()
 	select {
 	case err := <-done:
-		elapsed := time.Since(start)
-		if err != io.ErrNoProgress {
-			t.Errorf("Expected ErrNoProgress, got %v", err)
+		t.Errorf("Expected blocking read before close, got %v", err)
+	case <-time.After(120 * time.Millisecond):
+		// expected: blocking wait for packet or close
+		uq.Close()
+		if err := <-done; err != io.EOF {
+			t.Errorf("Expected EOF after close, got %v", err)
 		}
-		if elapsed < 90*time.Millisecond || elapsed > 150*time.Millisecond {
-			t.Errorf("Expected timeout ~100ms, got %v", elapsed)
-		}
-	case <-time.After(200 * time.Millisecond):
-		return
 	}
 }
 

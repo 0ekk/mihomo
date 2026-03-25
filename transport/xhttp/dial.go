@@ -1,6 +1,7 @@
 package xhttp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"github.com/gofrs/uuid/v5"
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/httptrace"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/quic-go"
 	http3 "github.com/metacubex/quic-go/http3"
 	"github.com/metacubex/tls"
@@ -95,7 +97,13 @@ func Dial(ctx context.Context, opts Options) (net.Conn, error) {
 		downloadCfg = cfg
 	}
 
-	sessionID := uuid.Must(uuid.NewV4()).String()
+	mode := resolveMode(cfg.Mode, opts.PreferStream, downloadCfg != cfg)
+	streamOneMode := mode == "stream-one"
+
+	sessionID := ""
+	if !streamOneMode {
+		sessionID = uuid.Must(uuid.NewV4()).String()
+	}
 
 	uploadEP, err := prepareEndpoint(cfg, opts, sessionID, false)
 	if err != nil {
@@ -110,8 +118,6 @@ func Dial(ctx context.Context, opts Options) (net.Conn, error) {
 			return nil, err
 		}
 	}
-
-	mode := resolveMode(cfg.Mode, opts.PreferStream, downloadCfg != cfg)
 
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -330,17 +336,29 @@ func dialPacketUp(ctx context.Context, cancel context.CancelFunc, uploadEP, down
 	}
 
 	pr, pw := io.Pipe()
+	maxPostBytes := int(uploadEP.cfg.ScMaxEachPostBytes.Random())
+	if maxPostBytes <= 0 {
+		maxPostBytes = 1024 * 1024
+	}
+	flushEvery := 2 * time.Millisecond
+	if cfgInterval := time.Duration(uploadEP.cfg.ScMinPostsIntervalMs.Random()) * time.Millisecond; cfgInterval > flushEvery {
+		flushEvery = cfgInterval
+	}
+	if flushEvery > 15*time.Millisecond {
+		flushEvery = 15 * time.Millisecond
+	}
+	writer := newPacketBatchWriter(pw, maxPostBytes, flushEvery)
 
 	uploadDone := make(chan error, 1)
 
 	conn := &splitConn{
 		reader: downloadResp.Body,
-		writer: &pipeWriter{PipeWriter: pw},
+		writer: writer,
 		remote: remoteAddr,
 		local:  localAddr,
 		onClose: func() {
 			cancel()
-			_ = pw.Close()
+			_ = writer.Close()
 			_ = downloadResp.Body.Close()
 			select {
 			case <-uploadDone:
@@ -361,6 +379,7 @@ func dialPacketUp(ctx context.Context, cancel context.CancelFunc, uploadEP, down
 
 func handleUploads(ctx context.Context, ep *endpoint, reader *io.PipeReader, downloadBody io.ReadCloser) error {
 	defer reader.Close()
+	startedAt := time.Now()
 	maxPostBytes := int(ep.cfg.ScMaxEachPostBytes.Random())
 	if maxPostBytes <= 0 {
 		maxPostBytes = 1024 * 1024
@@ -368,50 +387,257 @@ func handleUploads(ctx context.Context, ep *endpoint, reader *io.PipeReader, dow
 	buf := make([]byte, maxPostBytes)
 	seq := int64(0)
 	interval := time.Duration(ep.cfg.ScMinPostsIntervalMs.Random()) * time.Millisecond
+	lastPostStart := time.Time{}
 	basePath := strings.TrimSuffix(ep.url.Path, "/")
+	maxInFlight := int(ep.cfg.ScMaxBufferedPosts.Random())
+	if maxInFlight <= 0 {
+		maxInFlight = DefaultMaxPackets
+	}
+	inFlight := make(chan struct{}, maxInFlight)
+	errCh := make(chan error, 1)
+	const progressLogEvery = int64(256)
+	queuedPackets := int64(0)
+	queuedBytes := int64(0)
+	var donePackets atomic.Int64
+	var doneBytes atomic.Int64
+	var failedPackets atomic.Int64
+	var postWG sync.WaitGroup
+	reportErr := func(e error) {
+		if e == nil {
+			return
+		}
+		select {
+		case errCh <- e:
+		default:
+		}
+	}
+	emitSummary := func(stage string, err error) {
+		completed := donePackets.Load()
+		completedBytes := doneBytes.Load()
+		failed := failedPackets.Load()
+		d := time.Since(startedAt)
+		if err != nil {
+			log.Warnln("xhttp: packet-up upload summary stage=%s path=%s queued=%d queued_bytes=%d completed=%d completed_bytes=%d failed=%d inflight=%d duration=%s err=%v",
+				stage, basePath, queuedPackets, queuedBytes, completed, completedBytes, failed, len(inFlight), d, err)
+			return
+		}
+		log.Infoln("xhttp: packet-up upload summary stage=%s path=%s queued=%d queued_bytes=%d completed=%d completed_bytes=%d failed=%d duration=%s",
+			stage, basePath, queuedPackets, queuedBytes, completed, completedBytes, failed, d)
+	}
+
+	postOnce := func(payload []byte, postSeq int64) {
+		postWG.Add(1)
+		inFlight <- struct{}{}
+		go func() {
+			defer postWG.Done()
+			defer func() { <-inFlight }()
+
+			const maxUploadAttempts = 2
+			const retryBackoff = 60 * time.Millisecond
+			var finalErr error
+
+			for attempt := 1; attempt <= maxUploadAttempts; attempt++ {
+				urlCopy := *ep.url
+				urlCopy.Path = fmt.Sprintf("%s/%d", basePath, postSeq)
+				req, reqErr := http.NewRequestWithContext(withoutCancel(ctx), http.MethodPost, urlCopy.String(), bytes.NewReader(payload))
+				if reqErr != nil {
+					finalErr = reqErr
+					break
+				}
+				applyHeaders(req, ep.cfg, ep.url)
+				if ep.cfg.NoGRPCHeader {
+					req.Header.Del("Content-Type")
+				}
+
+				resp, reqErr := ep.client.Do(req)
+				if reqErr != nil {
+					finalErr = reqErr
+					if attempt < maxUploadAttempts {
+						time.Sleep(retryBackoff)
+						continue
+					}
+					break
+				}
+
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+
+				if resp.StatusCode == http.StatusOK {
+					finalErr = nil
+					break
+				}
+
+				statusErr := fmt.Errorf("xhttp: unexpected upload status %d", resp.StatusCode)
+				finalErr = statusErr
+				if resp.StatusCode >= 500 && attempt < maxUploadAttempts {
+					time.Sleep(retryBackoff)
+					continue
+				}
+				break
+			}
+
+			if finalErr != nil {
+				failIdx := failedPackets.Add(1)
+				if failIdx <= 5 || failIdx%50 == 0 {
+					if strings.Contains(finalErr.Error(), "unexpected upload status") {
+						log.Warnln("xhttp: packet-up upload bad status path=%s seq=%d bytes=%d inflight=%d err=%v", basePath, postSeq, len(payload), len(inFlight), finalErr)
+					} else {
+						log.Warnln("xhttp: packet-up upload request failed path=%s seq=%d bytes=%d inflight=%d err=%v", basePath, postSeq, len(payload), len(inFlight), finalErr)
+					}
+				}
+				reportErr(finalErr)
+				_ = downloadBody.Close()
+				reader.CloseWithError(finalErr)
+				return
+			}
+			donePackets.Add(1)
+			doneBytes.Add(int64(len(payload)))
+		}()
+	}
 
 	for {
+		select {
+		case uploadErr := <-errCh:
+			postWG.Wait()
+			emitSummary("error-early", uploadErr)
+			return uploadErr
+		default:
+		}
+
 		n, err := reader.Read(buf)
 		if n > 0 {
-			urlCopy := *ep.url
-			urlCopy.Path = fmt.Sprintf("%s/%d", basePath, seq)
-			req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, urlCopy.String(), bytes.NewReader(buf[:n]))
-			if reqErr != nil {
-				_ = downloadBody.Close()
-				reader.CloseWithError(reqErr)
-				return reqErr
+			if wait := minPostIntervalWait(interval, lastPostStart, time.Now()); wait > 0 {
+				time.Sleep(wait)
 			}
-			applyHeaders(req, ep.cfg, ep.url)
-			if ep.cfg.NoGRPCHeader {
-				req.Header.Del("Content-Type")
-			}
-			resp, reqErr := ep.client.Do(req)
-			if reqErr != nil {
-				_ = downloadBody.Close()
-				reader.CloseWithError(reqErr)
-				return reqErr
-			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			seq++
+			lastPostStart = time.Now()
 
-			if interval > 0 {
-				select {
-				case <-time.After(interval):
-				case <-ctx.Done():
-					reader.CloseWithError(ctx.Err())
-					return ctx.Err()
-				}
+			payload := make([]byte, n)
+			copy(payload, buf[:n])
+			queuedPackets++
+			queuedBytes += int64(n)
+			if queuedPackets%progressLogEvery == 0 {
+				log.Infoln("xhttp: packet-up upload progress path=%s queued=%d completed=%d failed=%d inflight=%d queued_bytes=%d interval_ms=%d max_post_bytes=%d max_inflight=%d",
+					basePath,
+					queuedPackets,
+					donePackets.Load(),
+					failedPackets.Load(),
+					len(inFlight),
+					queuedBytes,
+					interval/time.Millisecond,
+					maxPostBytes,
+					maxInFlight,
+				)
 			}
+			postOnce(payload, seq)
+			seq++
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				reader.CloseWithError(err)
+				postWG.Wait()
+				emitSummary("read-error", err)
 				return err
 			}
-			return nil
+			postWG.Wait()
+			select {
+			case uploadErr := <-errCh:
+				emitSummary("error-on-eof", uploadErr)
+				return uploadErr
+			default:
+				emitSummary("eof", nil)
+				return nil
+			}
 		}
 	}
+}
+
+func minPostIntervalWait(interval time.Duration, lastPostStart, now time.Time) time.Duration {
+	if interval <= 0 || lastPostStart.IsZero() {
+		return 0
+	}
+	elapsed := now.Sub(lastPostStart)
+	if elapsed >= interval {
+		return 0
+	}
+	return interval - elapsed
+}
+
+type packetBatchWriter struct {
+	base       *io.PipeWriter
+	buffered   *bufio.Writer
+	flushEvery time.Duration
+	closed     atomic.Bool
+	flushStop  chan struct{}
+	flushDone  chan struct{}
+	mu         sync.Mutex
+}
+
+func newPacketBatchWriter(base *io.PipeWriter, maxChunk int, flushEvery time.Duration) *packetBatchWriter {
+	if maxChunk <= 0 {
+		maxChunk = 1024 * 1024
+	}
+	if flushEvery <= 0 {
+		flushEvery = 2 * time.Millisecond
+	}
+	w := &packetBatchWriter{
+		base:       base,
+		buffered:   bufio.NewWriterSize(base, maxChunk),
+		flushEvery: flushEvery,
+		flushStop:  make(chan struct{}),
+		flushDone:  make(chan struct{}),
+	}
+	go w.flushLoop()
+	return w
+}
+
+func (w *packetBatchWriter) flushLoop() {
+	ticker := time.NewTicker(w.flushEvery)
+	defer ticker.Stop()
+	defer close(w.flushDone)
+
+	for {
+		select {
+		case <-ticker.C:
+			w.mu.Lock()
+			_ = w.buffered.Flush()
+			w.mu.Unlock()
+		case <-w.flushStop:
+			return
+		}
+	}
+}
+
+func (w *packetBatchWriter) Write(b []byte) (int, error) {
+	if w.closed.Load() {
+		return 0, io.ErrClosedPipe
+	}
+	w.mu.Lock()
+	n, err := w.buffered.Write(b)
+	if err == nil {
+		if w.buffered.Available() == 0 {
+			err = w.buffered.Flush()
+		}
+	}
+	w.mu.Unlock()
+	return n, err
+}
+
+func (w *packetBatchWriter) Close() error {
+	if !w.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	close(w.flushStop)
+	<-w.flushDone
+
+	w.mu.Lock()
+	flushErr := w.buffered.Flush()
+	closeErr := w.base.Close()
+	w.mu.Unlock()
+
+	if flushErr != nil {
+		return flushErr
+	}
+	return closeErr
 }
 
 func applyHeaders(req *http.Request, cfg *Config, baseURL *url.URL) {
@@ -565,10 +791,14 @@ func (w *pipeWriter) Write(b []byte) (int, error) {
 }
 
 func buildBaseURL(cfg *Config, scheme, host, sessionID string) *url.URL {
+	path := cfg.Path
+	if sessionID != "" {
+		path += sessionID
+	}
 	u := &url.URL{
 		Scheme: scheme,
 		Host:   host,
-		Path:   cfg.Path + sessionID,
+		Path:   path,
 	}
 	return u
 }

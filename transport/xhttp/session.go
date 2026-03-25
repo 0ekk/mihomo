@@ -48,14 +48,18 @@ type uploadQueue struct {
 	nextSeq       uint64
 	maxPackets    int
 	closed        atomic.Bool
+	writeCloseMu  sync.Mutex
 	mu            sync.Mutex
 }
 
 func newUploadQueue(maxPackets int) *uploadQueue {
+	if maxPackets <= 0 {
+		maxPackets = DefaultMaxPackets
+	}
 	h := &uploadHeap{}
 	heap.Init(h)
 	return &uploadQueue{
-		pushedPackets: make(chan Packet, DefaultPacketChannelSize),
+		pushedPackets: make(chan Packet, maxPackets),
 		heap:          h,
 		nextSeq:       0,
 		maxPackets:    maxPackets,
@@ -63,24 +67,15 @@ func newUploadQueue(maxPackets int) *uploadQueue {
 }
 
 func (uq *uploadQueue) Push(packet Packet) error {
+	uq.writeCloseMu.Lock()
+	defer uq.writeCloseMu.Unlock()
+
 	if uq.closed.Load() {
 		return io.ErrClosedPipe
 	}
-	timer := time.NewTimer(DefaultEnqueueTimeout)
-	defer timer.Stop()
-	select {
-	case uq.pushedPackets <- packet:
-		return nil
-	case <-timer.C:
-		return io.ErrShortBuffer
-	default:
-		select {
-		case uq.pushedPackets <- packet:
-			return nil
-		case <-timer.C:
-			return io.ErrShortBuffer
-		}
-	}
+
+	uq.pushedPackets <- packet
+	return nil
 }
 
 func (uq *uploadQueue) Read(p []byte) (n int, err error) {
@@ -113,37 +108,37 @@ func (uq *uploadQueue) Read(p []byte) (n int, err error) {
 			return 0, io.ErrUnexpectedEOF
 		}
 
-		timer := time.NewTimer(DefaultPollInterval)
 		uq.mu.Unlock()
-		select {
-		case packet := <-uq.pushedPackets:
-			timer.Stop()
-			uq.mu.Lock()
-			if uq.heap.Len() >= uq.maxPackets {
-				return 0, io.ErrShortBuffer
+		packet, ok := <-uq.pushedPackets
+		uq.mu.Lock()
+		if !ok {
+			if uq.heap.Len() == 0 {
+				return 0, io.EOF
 			}
-			heap.Push(uq.heap, packet)
-			continue
-		case <-timer.C:
-			uq.mu.Lock()
-			if uq.heap.Len() > 0 {
-				continue
-			}
-			return 0, io.ErrNoProgress
+			return 0, io.ErrUnexpectedEOF
 		}
+		if uq.heap.Len() >= uq.maxPackets {
+			return 0, io.ErrShortBuffer
+		}
+		heap.Push(uq.heap, packet)
 	}
 }
 
 func (uq *uploadQueue) Close() error {
-	if uq.closed.CompareAndSwap(false, true) {
-		close(uq.pushedPackets)
-		uq.mu.Lock()
-		defer uq.mu.Unlock()
-		for uq.heap.Len() > 0 {
-			packet := heap.Pop(uq.heap).(Packet)
-			if packet.Reader != nil {
-				packet.Reader.Close()
-			}
+	uq.writeCloseMu.Lock()
+	defer uq.writeCloseMu.Unlock()
+
+	if !uq.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	close(uq.pushedPackets)
+	uq.mu.Lock()
+	defer uq.mu.Unlock()
+	for uq.heap.Len() > 0 {
+		packet := heap.Pop(uq.heap).(Packet)
+		if packet.Reader != nil {
+			packet.Reader.Close()
 		}
 	}
 	return nil

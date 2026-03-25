@@ -2,14 +2,13 @@ package xhttp
 
 import (
 	"bytes"
-	"io"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gofrs/uuid/v5"
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/httptest"
-	"github.com/gofrs/uuid/v5"
 )
 
 func TestValidateRequest(t *testing.T) {
@@ -212,8 +211,8 @@ func TestCleanupExpiredSessionsReapsFullyConnectedWhenExpired(t *testing.T) {
 	cfg := &Config{}
 	cfg.normalize()
 	handler := &requestHandler{
-		config:      cfg,
-		idleTimeout: 50 * time.Millisecond,
+		config:               cfg,
+		idleTimeout:          50 * time.Millisecond,
 		connectedIdleTimeout: 200 * time.Millisecond,
 	}
 
@@ -269,7 +268,7 @@ func TestHandleStreamUpload(t *testing.T) {
 	req := httptest.NewRequest("POST", "/xhttp/"+sessionID, body)
 	w := httptest.NewRecorder()
 
-	handler.handleStreamUpload(w, req, sessionID)
+	handler.handleStreamUpload(w, req, sessionID, false)
 
 	if w.Code != http.StatusOK {
 		t.Errorf("Status = %v, want %v", w.Code, http.StatusOK)
@@ -454,6 +453,28 @@ func TestServeHTTP(t *testing.T) {
 		}
 	})
 
+	t.Run("POST stream-one base path", func(t *testing.T) {
+		body := strings.NewReader("stream-one data")
+		req := httptest.NewRequest("POST", "http://example.com/xhttp/", body)
+		req.Host = "example.com"
+		w := httptest.NewRecorder()
+
+		handler.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("Status = %v, want %v", w.Code, http.StatusOK)
+		}
+
+		count := 0
+		handler.sessions.Range(func(_, _ any) bool {
+			count++
+			return true
+		})
+		if count > 1 {
+			t.Errorf("unexpected session count after stream-one request: %d", count)
+		}
+	})
+
 	t.Run("POST packet upload", func(t *testing.T) {
 		body := bytes.NewReader([]byte("packet"))
 		req := httptest.NewRequest("POST", "http://example.com/xhttp/"+sessionID+"/0", body)
@@ -627,14 +648,36 @@ func TestBufferOverflow(t *testing.T) {
 	sessionID := uuid.Must(uuid.NewV4()).String()
 	session, _ := handler.getOrCreateSession(sessionID)
 
-	for i := 0; i < 100; i++ {
-		err := session.uploadQueue.Push(Packet{
-			Payload: []byte("overflow"),
-			Seq:     uint64(i),
-		})
-		if err == io.ErrShortBuffer {
-			return
-		}
+	if err := session.uploadQueue.Push(Packet{Payload: []byte("0"), Seq: 0}); err != nil {
+		t.Fatalf("push 0 failed: %v", err)
 	}
-	t.Error("Expected ErrShortBuffer but uploads succeeded")
+	if err := session.uploadQueue.Push(Packet{Payload: []byte("1"), Seq: 1}); err != nil {
+		t.Fatalf("push 1 failed: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- session.uploadQueue.Push(Packet{Payload: []byte("2"), Seq: 2})
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("expected blocking push, got immediate result: %v", err)
+	case <-time.After(80 * time.Millisecond):
+		// expected: blocked by backpressure
+	}
+
+	buf := make([]byte, 16)
+	if _, err := session.uploadQueue.Read(buf); err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("blocked push should succeed after read: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting blocked push to complete")
+	}
 }
