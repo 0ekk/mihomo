@@ -217,8 +217,13 @@ func prepareEndpoint(cfg *Config, opts Options, sessionID string, isDownload boo
 
 func dialStreamOne(ctx context.Context, cancel context.CancelFunc, ep *endpoint) (net.Conn, error) {
 	pr, pw := io.Pipe()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.url.String(), pr)
+	// Isolate POST request from parent context cancellation using withoutCancel
+	// This ensures the upload won't be interrupted by parent timeout/cancellation
+	// similar to Xray's implementation
+	postCtx, cancelPost := context.WithCancel(withoutCancel(ctx))
+	req, err := http.NewRequestWithContext(postCtx, http.MethodPost, ep.url.String(), pr)
 	if err != nil {
+		cancelPost()
 		return nil, err
 	}
 	applyHeaders(req, ep.cfg, ep.url)
@@ -228,6 +233,7 @@ func dialStreamOne(ctx context.Context, cancel context.CancelFunc, ep *endpoint)
 
 	resp, remoteAddr, localAddr, err := doRequest(ep.client, req)
 	if err != nil {
+		cancelPost()
 		return nil, err
 	}
 
@@ -238,6 +244,7 @@ func dialStreamOne(ctx context.Context, cancel context.CancelFunc, ep *endpoint)
 		local:  localAddr,
 		onClose: func() {
 			cancel()
+			cancelPost()
 			_ = pw.Close()
 			_ = resp.Body.Close()
 			ep.release()
@@ -648,7 +655,7 @@ func applyHeaders(req *http.Request, cfg *Config, baseURL *url.URL) {
 		req.Header.Set(k, v)
 	}
 	req.Host = baseURL.Host
-	req.Header.Set("Referer", withPadding(baseURL.String(), int(cfg.XPaddingBytes.Random())))
+	cfg.ApplyXPaddingToRequest(req, cfg.buildRequestXPaddingConfig(baseURL.String()))
 
 	q := req.URL.Query()
 	if !cfg.ScStreamUpServerSecs.IsZero() {

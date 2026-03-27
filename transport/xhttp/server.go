@@ -80,6 +80,8 @@ func (s *streamUploadConn) Write(p []byte) (int, error) {
 }
 
 func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.writeResponseHeader(w)
+
 	if err := h.validateRequest(r); err != nil {
 		log.Debugln("xhttp: validation failed: %v", err)
 		http.Error(w, "Bad Request", http.StatusBadRequest)
@@ -99,8 +101,7 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodPost {
 		if h.isBasePath(r.URL.Path) {
-			sessionID := uuid.Must(uuid.NewV4()).String()
-			h.handleStreamUpload(w, r, sessionID, true)
+			h.handleStreamOneUpload(w, r)
 			return
 		}
 
@@ -121,6 +122,14 @@ func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 }
 
+func (h *requestHandler) writeResponseHeader(w http.ResponseWriter) {
+	// CORS headers for browser dialer parity with Xray.
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "*")
+
+	h.config.ApplyXPaddingToHeader(w.Header(), h.config.buildResponseXPaddingConfig())
+}
+
 func (h *requestHandler) validateRequest(r *http.Request) error {
 	if h.config.Host != "" && r.Host != h.config.Host && r.Host != "" {
 		return fmt.Errorf("host mismatch: expected %s, got %s", h.config.Host, r.Host)
@@ -128,6 +137,15 @@ func (h *requestHandler) validateRequest(r *http.Request) error {
 
 	if !strings.HasPrefix(r.URL.Path, h.config.Path) {
 		return fmt.Errorf("path mismatch: expected prefix %s", h.config.Path)
+	}
+
+	paddingRange := h.config.XPaddingBytes.WithDefault(100, 1000)
+	padding, paddingPlacement := h.config.ExtractXPaddingFromRequest(r, h.config.XPaddingObfsMode)
+	if padding == "" {
+		return nil
+	}
+	if !h.config.IsPaddingValid(padding, paddingRange.From, paddingRange.To, PaddingMethod(h.config.XPaddingMethod)) {
+		return fmt.Errorf("invalid x_padding (%s) length: %d not in [%d, %d]", paddingPlacement, len(padding), paddingRange.From, paddingRange.To)
 	}
 
 	return nil
@@ -355,6 +373,48 @@ func (h *requestHandler) handleDownload(w http.ResponseWriter, r *http.Request, 
 			}
 		}
 	}
+}
+
+func (h *requestHandler) handleStreamOneUpload(w http.ResponseWriter, r *http.Request) {
+	h.applyResponseHeaders(w)
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	httpSC := newStreamUploadConn(r.Body, w)
+
+	remoteAddr, _ := net.ResolveTCPAddr("tcp", r.RemoteAddr)
+	localAddr, _ := net.ResolveTCPAddr("tcp", r.Host)
+	if remoteAddr == nil {
+		remoteAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+	}
+	if localAddr == nil {
+		localAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+	}
+
+	conn := &splitConn{
+		reader: httpSC,
+		writer: httpSC,
+		remote: remoteAddr,
+		local:  localAddr,
+	}
+
+	if h.tunnel == nil {
+		_ = conn.Close()
+		return
+	}
+
+	go h.tunnel.HandleTCPConn(inbound.NewSocket(socks5.ParseAddr("0.0.0.0:0"), conn, C.HTTPS, h.additions...))
+
+	select {
+	case <-r.Context().Done():
+	case <-httpSC.Wait():
+	}
+
+	_ = conn.Close()
 }
 
 func (h *requestHandler) handleStreamUpload(w http.ResponseWriter, r *http.Request, sessionID string, closeWhenDone bool) {

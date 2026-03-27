@@ -20,6 +20,11 @@ type Config struct {
 	NoGRPCHeader         bool              `proxy:"no-grpc-header,omitempty" json:"no-grpc-header"`
 	NoSSEHeader          bool              `proxy:"no-sse-header,omitempty" json:"no-sse-header"`
 	XPaddingBytes        Range             `proxy:"x-padding-bytes,omitempty" json:"x-padding-bytes"`
+	XPaddingObfsMode     bool              `proxy:"x-padding-obfs-mode,omitempty" json:"x-padding-obfs-mode"`
+	XPaddingKey          string            `proxy:"x-padding-key,omitempty" json:"x-padding-key"`
+	XPaddingHeader       string            `proxy:"x-padding-header,omitempty" json:"x-padding-header"`
+	XPaddingPlacement    string            `proxy:"x-padding-placement,omitempty" json:"x-padding-placement"`
+	XPaddingMethod       string            `proxy:"x-padding-method,omitempty" json:"x-padding-method"`
 	ScMaxEachPostBytes   Range             `proxy:"sc-max-each-post-bytes,omitempty" json:"sc-max-each-post-bytes"`
 	ScMinPostsIntervalMs Range             `proxy:"sc-min-posts-interval-ms,omitempty" json:"sc-min-posts-interval-ms"`
 	ScMaxBufferedPosts   Range             `proxy:"sc-max-buffered-posts,omitempty" json:"sc-max-buffered-posts"`
@@ -80,6 +85,7 @@ func defaultConfig() *Config {
 		ScMaxEachPostBytes:   Range{From: 1_000_000, To: 1_000_000},
 		ScMinPostsIntervalMs: Range{From: 30, To: 30},
 		ScMaxBufferedPosts:   Range{From: 30, To: 30},
+		ScStreamUpServerSecs: Range{From: 20, To: 80},
 	}
 }
 
@@ -92,6 +98,8 @@ func (c *Config) normalize() {
 	c.ScMaxEachPostBytes = c.ScMaxEachPostBytes.WithDefault(1_000_000, 1_000_000)
 	c.ScMinPostsIntervalMs = c.ScMinPostsIntervalMs.WithDefault(30, 30)
 	c.ScMaxBufferedPosts = c.ScMaxBufferedPosts.WithDefault(30, 30)
+	c.ScStreamUpServerSecs = c.ScStreamUpServerSecs.WithDefault(20, 80)
+	c.normalizeXPadding()
 	switch c.Mode {
 	case "", "auto", "packet-up", "stream-up", "stream-one":
 	default:
@@ -101,6 +109,28 @@ func (c *Config) normalize() {
 		c.Xmux = &XmuxConfig{}
 	}
 	c.Xmux.normalize()
+}
+
+func (c *Config) normalizeXPadding() {
+	if c == nil || !c.XPaddingObfsMode {
+		return
+	}
+	if c.XPaddingKey == "" {
+		c.XPaddingKey = "x_padding"
+	}
+	if c.XPaddingHeader == "" {
+		c.XPaddingHeader = "Referer"
+	}
+	switch c.XPaddingPlacement {
+	case PlacementQueryInHeader, PlacementCookie, PlacementHeader, PlacementQuery:
+	default:
+		c.XPaddingPlacement = PlacementQueryInHeader
+	}
+	switch PaddingMethod(c.XPaddingMethod) {
+	case PaddingMethodRepeatX, PaddingMethodTokenish:
+	default:
+		c.XPaddingMethod = string(PaddingMethodRepeatX)
+	}
 }
 
 func normalizePath(p string) string {

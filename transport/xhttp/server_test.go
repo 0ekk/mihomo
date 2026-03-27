@@ -37,12 +37,39 @@ func TestValidateRequest(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest("GET", "http://"+tt.host+tt.path, nil)
 			req.Host = tt.host
+			req.Header.Set("Referer", withPadding("http://example.com/", 128))
 			err := handler.validateRequest(req)
 			if (err != nil) != tt.expectError {
 				t.Errorf("validateRequest() error = %v, expectError %v", err, tt.expectError)
 			}
 		})
 	}
+}
+
+func TestValidateRequestPadding(t *testing.T) {
+	cfg := &Config{Host: "example.com", Path: "/xhttp/"}
+	cfg.normalize()
+	handler := &requestHandler{config: cfg}
+
+	t.Run("missing padding is allowed", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "http://example.com/xhttp/test", nil)
+		req.Host = "example.com"
+		req.Header.Set("Referer", "http://example.com/")
+
+		if err := handler.validateRequest(req); err != nil {
+			t.Fatalf("validateRequest() expected nil for missing padding, got %v", err)
+		}
+	})
+
+	t.Run("invalid padding still rejected", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "http://example.com/xhttp/test", nil)
+		req.Host = "example.com"
+		req.Header.Set("Referer", withPadding("http://example.com/", 1))
+
+		if err := handler.validateRequest(req); err == nil {
+			t.Fatal("validateRequest() expected padding error, got nil")
+		}
+	})
 }
 
 func TestParseSessionID(t *testing.T) {
@@ -392,6 +419,25 @@ func TestApplyResponseHeaders(t *testing.T) {
 	}
 }
 
+func TestWriteResponseHeader(t *testing.T) {
+	cfg := &Config{}
+	cfg.normalize()
+	handler := &requestHandler{config: cfg}
+	w := httptest.NewRecorder()
+
+	handler.writeResponseHeader(w)
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want *", got)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Methods"); got != "*" {
+		t.Fatalf("Access-Control-Allow-Methods = %q, want *", got)
+	}
+	if padding := w.Header().Get("X-Padding"); len(padding) < 100 || len(padding) > 1000 {
+		t.Fatalf("X-Padding length = %d, want in [100,1000]", len(padding))
+	}
+}
+
 func TestServeHTTP(t *testing.T) {
 	cfg := &Config{
 		Host: "example.com",
@@ -407,6 +453,7 @@ func TestServeHTTP(t *testing.T) {
 	t.Run("invalid host", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "http://wrong.com/xhttp/"+sessionID, nil)
 		req.Host = "wrong.com"
+		req.Header.Set("Referer", withPadding("http://example.com/", 128))
 		w := httptest.NewRecorder()
 
 		handler.ServeHTTP(w, req)
@@ -414,11 +461,21 @@ func TestServeHTTP(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("Status = %v, want %v", w.Code, http.StatusBadRequest)
 		}
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+			t.Errorf("Access-Control-Allow-Origin = %q, want *", got)
+		}
+		if got := w.Header().Get("Access-Control-Allow-Methods"); got != "*" {
+			t.Errorf("Access-Control-Allow-Methods = %q, want *", got)
+		}
+		if padding := w.Header().Get("X-Padding"); len(padding) < 100 || len(padding) > 1000 {
+			t.Errorf("X-Padding length = %d, want in [100,1000]", len(padding))
+		}
 	})
 
 	t.Run("invalid session ID", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "http://example.com/xhttp/invalid-uuid", nil)
 		req.Host = "example.com"
+		req.Header.Set("Referer", withPadding("http://example.com/", 128))
 		w := httptest.NewRecorder()
 
 		handler.ServeHTTP(w, req)
@@ -431,6 +488,7 @@ func TestServeHTTP(t *testing.T) {
 	t.Run("method not allowed", func(t *testing.T) {
 		req := httptest.NewRequest("DELETE", "http://example.com/xhttp/"+sessionID, nil)
 		req.Host = "example.com"
+		req.Header.Set("Referer", withPadding("http://example.com/", 128))
 		w := httptest.NewRecorder()
 
 		handler.ServeHTTP(w, req)
@@ -444,6 +502,7 @@ func TestServeHTTP(t *testing.T) {
 		body := strings.NewReader("stream data")
 		req := httptest.NewRequest("POST", "http://example.com/xhttp/"+sessionID, body)
 		req.Host = "example.com"
+		req.Header.Set("Referer", withPadding("http://example.com/", 128))
 		w := httptest.NewRecorder()
 
 		handler.ServeHTTP(w, req)
@@ -457,6 +516,7 @@ func TestServeHTTP(t *testing.T) {
 		body := strings.NewReader("stream-one data")
 		req := httptest.NewRequest("POST", "http://example.com/xhttp/", body)
 		req.Host = "example.com"
+		req.Header.Set("Referer", withPadding("http://example.com/", 128))
 		w := httptest.NewRecorder()
 
 		handler.ServeHTTP(w, req)
@@ -479,6 +539,7 @@ func TestServeHTTP(t *testing.T) {
 		body := bytes.NewReader([]byte("packet"))
 		req := httptest.NewRequest("POST", "http://example.com/xhttp/"+sessionID+"/0", body)
 		req.Host = "example.com"
+		req.Header.Set("Referer", withPadding("http://example.com/", 128))
 		w := httptest.NewRecorder()
 
 		handler.ServeHTTP(w, req)
@@ -490,6 +551,32 @@ func TestServeHTTP(t *testing.T) {
 
 	session, _ := handler.getOrCreateSession(sessionID)
 	session.uploadQueue.Close()
+}
+
+func TestServeHTTPStreamOneBasePathDoesNotCreateSession(t *testing.T) {
+	cfg := &Config{Path: "/xhttp/"}
+	cfg.normalize()
+	handler := &requestHandler{config: cfg}
+
+	req := httptest.NewRequest("POST", "http://example.com/xhttp/", strings.NewReader("stream-one data"))
+	req.Header.Set("Referer", withPadding("http://example.com/", 128))
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Status = %v, want %v", w.Code, http.StatusOK)
+	}
+
+	count := 0
+	handler.sessions.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+
+	if count != 0 {
+		t.Fatalf("stream-one base path should not create sessions, got %d", count)
+	}
 }
 
 func TestHandleDownloadStream(t *testing.T) {
