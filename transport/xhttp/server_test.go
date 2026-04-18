@@ -589,32 +589,6 @@ func TestServeHTTPStreamOneBasePathDoesNotCreateSession(t *testing.T) {
 	}
 }
 
-func TestServeHTTPStreamOneBasePathDoesNotCreateSession(t *testing.T) {
-	cfg := &Config{Path: "/xhttp/"}
-	cfg.normalize()
-	handler := &requestHandler{config: cfg}
-
-	req := httptest.NewRequest("POST", "http://example.com/xhttp/", strings.NewReader("stream-one data"))
-	req.Header.Set("Referer", withPadding("http://example.com/", 128))
-	w := httptest.NewRecorder()
-
-	handler.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("Status = %v, want %v", w.Code, http.StatusOK)
-	}
-
-	count := 0
-	handler.sessions.Range(func(_, _ any) bool {
-		count++
-		return true
-	})
-
-	if count != 0 {
-		t.Fatalf("stream-one base path should not create sessions, got %d", count)
-	}
-}
-
 func TestHandleDownloadStream(t *testing.T) {
 	cfg := &Config{}
 	cfg.normalize()

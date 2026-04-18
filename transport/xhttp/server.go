@@ -384,48 +384,6 @@ func (h *requestHandler) handleDownload(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
-func (h *requestHandler) handleStreamOneUpload(w http.ResponseWriter, r *http.Request) {
-	h.applyResponseHeaders(w)
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-
-	httpSC := newStreamUploadConn(r.Body, w)
-
-	remoteAddr, _ := net.ResolveTCPAddr("tcp", r.RemoteAddr)
-	localAddr, _ := net.ResolveTCPAddr("tcp", r.Host)
-	if remoteAddr == nil {
-		remoteAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
-	}
-	if localAddr == nil {
-		localAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
-	}
-
-	conn := &splitConn{
-		reader: httpSC,
-		writer: httpSC,
-		remote: remoteAddr,
-		local:  localAddr,
-	}
-
-	if h.tunnel == nil {
-		_ = conn.Close()
-		return
-	}
-
-	go h.tunnel.HandleTCPConn(inbound.NewSocket(socks5.ParseAddr("0.0.0.0:0"), conn, C.HTTPS, h.additions...))
-
-	select {
-	case <-r.Context().Done():
-	case <-httpSC.Wait():
-	}
-
-	_ = conn.Close()
-}
-
 func (h *requestHandler) handleStreamUpload(w http.ResponseWriter, r *http.Request, sessionID string, closeWhenDone bool) {
 	session, err := h.getOrCreateSession(sessionID)
 	if err != nil {
