@@ -187,7 +187,15 @@ jobs:
       if: ${{ matrix.jobs.goversion == '' }}
       run: |
         cd $(go env GOROOT)
-        patch --verbose -p 1 < $GITHUB_WORKSPACE/.github/patch/cl747663.patch
+        PATCH_FILE="$GITHUB_WORKSPACE/.github/patch/cl747663.patch"
+        if patch --dry-run --forward -p 1 < "$PATCH_FILE" >/dev/null 2>&1; then
+          patch --verbose --forward -p 1 < "$PATCH_FILE"
+        elif patch --dry-run --reverse -p 1 < "$PATCH_FILE" >/dev/null 2>&1; then
+          echo "CL747663 already applied, skipping"
+        else
+          echo "CL747663 patch cannot be applied cleanly" >&2
+          exit 1
+        fi
 
       # this patch file only works on golang1.26.x
       # that means after golang1.27 release it must be changed
