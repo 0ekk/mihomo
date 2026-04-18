@@ -158,6 +158,47 @@ func TestUploadQueueOutOfOrder(t *testing.T) {
 	<-done
 }
 
+func TestUploadQueuePartialReadKeepsRemainingPayload(t *testing.T) {
+	uq := newUploadQueue(10)
+	defer uq.Close()
+
+	payload := []byte("abcdefghijklmnopqrstuvwxyz")
+	if err := uq.Push(Packet{Payload: payload, Seq: 0}); err != nil {
+		t.Fatalf("Push failed: %v", err)
+	}
+
+	buf := make([]byte, 8)
+	collected := make([]byte, 0, len(payload))
+
+	for len(collected) < len(payload) {
+		n, err := uq.Read(buf)
+		if err != nil {
+			t.Fatalf("Read failed: %v", err)
+		}
+		collected = append(collected, buf[:n]...)
+	}
+
+	if string(collected) != string(payload) {
+		t.Fatalf("payload mismatch: got %q want %q", string(collected), string(payload))
+	}
+}
+
+func TestUploadQueueStreamModeRejectsFurtherPush(t *testing.T) {
+	uq := newUploadQueue(10)
+	defer uq.Close()
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	if err := uq.Push(Packet{Reader: pr, Seq: 0}); err != nil {
+		t.Fatalf("Push stream failed: %v", err)
+	}
+
+	if err := uq.Push(Packet{Payload: []byte("late"), Seq: 1}); err != io.ErrClosedPipe {
+		t.Fatalf("expected ErrClosedPipe after stream reader push, got %v", err)
+	}
+}
+
 func TestUploadQueueTimeout(t *testing.T) {
 	uq := newUploadQueue(10)
 	defer uq.Close()

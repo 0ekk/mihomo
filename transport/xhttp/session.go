@@ -2,6 +2,7 @@ package xhttp
 
 import (
 	"container/heap"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -47,10 +48,14 @@ type uploadQueue struct {
 	heap          *uploadHeap
 	nextSeq       uint64
 	maxPackets    int
+	reader        io.ReadCloser
+	nomore        bool
 	closed        atomic.Bool
 	writeCloseMu  sync.Mutex
 	mu            sync.Mutex
 }
+
+var errPacketQueueTooLarge = errors.New("xhttp: packet queue is too large")
 
 func newUploadQueue(maxPackets int) *uploadQueue {
 	if maxPackets <= 0 {
@@ -73,6 +78,12 @@ func (uq *uploadQueue) Push(packet Packet) error {
 	if uq.closed.Load() {
 		return io.ErrClosedPipe
 	}
+	if uq.nomore {
+		return io.ErrClosedPipe
+	}
+	if packet.Reader != nil {
+		uq.nomore = true
+	}
 
 	uq.pushedPackets <- packet
 	return nil
@@ -83,44 +94,85 @@ func (uq *uploadQueue) Read(p []byte) (n int, err error) {
 	defer uq.mu.Unlock()
 
 	for {
-		if uq.heap.Len() > 0 {
-			top := (*uq.heap)[0]
-			if top.Seq == uq.nextSeq {
-				heap.Pop(uq.heap)
-				uq.nextSeq++
+		if uq.reader != nil {
+			return uq.reader.Read(p)
+		}
 
-				if top.Payload != nil {
-					n = copy(p, top.Payload)
-					if n < len(top.Payload) {
-						return n, io.ErrShortBuffer
-					}
-					return n, nil
-				} else if top.Reader != nil {
-					return top.Reader.Read(p)
+		if uq.heap.Len() == 0 {
+			if uq.closed.Load() {
+				return 0, io.EOF
+			}
+
+			uq.mu.Unlock()
+			packet, ok := <-uq.pushedPackets
+			uq.mu.Lock()
+			if !ok {
+				if uq.reader != nil {
+					return uq.reader.Read(p)
 				}
-			}
-		}
-
-		if uq.closed.Load() {
-			if uq.heap.Len() == 0 {
 				return 0, io.EOF
 			}
-			return 0, io.ErrUnexpectedEOF
+
+			if packet.Reader != nil {
+				uq.reader = packet.Reader
+				continue
+			}
+			heap.Push(uq.heap, packet)
 		}
 
-		uq.mu.Unlock()
-		packet, ok := <-uq.pushedPackets
-		uq.mu.Lock()
-		if !ok {
-			if uq.heap.Len() == 0 {
-				return 0, io.EOF
+		for uq.heap.Len() > 0 {
+			packet := heap.Pop(uq.heap).(Packet)
+
+			if packet.Seq < uq.nextSeq {
+				continue
 			}
-			return 0, io.ErrUnexpectedEOF
+
+			if packet.Seq == uq.nextSeq {
+				if packet.Reader != nil {
+					uq.reader = packet.Reader
+					return uq.reader.Read(p)
+				}
+
+				n = copy(p, packet.Payload)
+				if n < len(packet.Payload) {
+					packet.Payload = packet.Payload[n:]
+					heap.Push(uq.heap, packet)
+				} else {
+					uq.nextSeq = packet.Seq + 1
+				}
+				return n, nil
+			}
+
+			if uq.heap.Len() > uq.maxPackets {
+				return 0, errPacketQueueTooLarge
+			}
+
+			heap.Push(uq.heap, packet)
+
+			uq.mu.Unlock()
+			nextPacket, ok := <-uq.pushedPackets
+			uq.mu.Lock()
+			if !ok {
+				if uq.reader != nil {
+					return uq.reader.Read(p)
+				}
+				if uq.heap.Len() == 0 {
+					return 0, io.EOF
+				}
+				return 0, io.ErrUnexpectedEOF
+			}
+
+			if nextPacket.Reader != nil {
+				if uq.reader == nil {
+					uq.reader = nextPacket.Reader
+				} else {
+					_ = nextPacket.Reader.Close()
+				}
+				continue
+			}
+
+			heap.Push(uq.heap, nextPacket)
 		}
-		if uq.heap.Len() >= uq.maxPackets {
-			return 0, io.ErrShortBuffer
-		}
-		heap.Push(uq.heap, packet)
 	}
 }
 
@@ -133,14 +185,33 @@ func (uq *uploadQueue) Close() error {
 	}
 
 	close(uq.pushedPackets)
+
 	uq.mu.Lock()
 	defer uq.mu.Unlock()
+
+	for packet := range uq.pushedPackets {
+		if packet.Reader != nil {
+			if uq.reader == nil {
+				uq.reader = packet.Reader
+			} else {
+				_ = packet.Reader.Close()
+			}
+			continue
+		}
+		heap.Push(uq.heap, packet)
+	}
+
 	for uq.heap.Len() > 0 {
 		packet := heap.Pop(uq.heap).(Packet)
 		if packet.Reader != nil {
-			packet.Reader.Close()
+			_ = packet.Reader.Close()
 		}
 	}
+
+	if uq.reader != nil {
+		return uq.reader.Close()
+	}
+
 	return nil
 }
 
@@ -306,21 +377,23 @@ func (c *xhttpConn) Write(b []byte) (n int, err error) {
 	data := make([]byte, len(b))
 	copy(data, b)
 
-	select {
-	case c.session.downloadQueue <- data:
-		c.session.touch(0)
-		return len(b), nil
-	case <-time.After(DefaultEnqueueTimeout):
-		return 0, io.ErrShortBuffer
-	default:
-		select {
-		case c.session.downloadQueue <- data:
-			c.session.touch(0)
-			return len(b), nil
-		case <-time.After(DefaultEnqueueTimeout):
-			return 0, io.ErrShortBuffer
-		}
+	if sendOnDownloadQueue(c.session.downloadQueue, data) {
+		return 0, io.ErrClosedPipe
 	}
+
+	c.session.touch(0)
+	return len(b), nil
+}
+
+func sendOnDownloadQueue(ch chan []byte, payload []byte) (closed bool) {
+	defer func() {
+		if recover() != nil {
+			closed = true
+		}
+	}()
+
+	ch <- payload
+	return false
 }
 
 func (c *xhttpConn) Close() error {

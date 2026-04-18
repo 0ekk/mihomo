@@ -287,6 +287,47 @@ func (h *requestHandler) runSessionJanitor(ctx context.Context) {
 	}
 }
 
+func (h *requestHandler) handleStreamOneUpload(w http.ResponseWriter, r *http.Request) {
+	h.applyResponseHeaders(w)
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	if h.tunnel == nil {
+		return
+	}
+
+	httpSC := newStreamUploadConn(r.Body, w)
+	defer httpSC.Close()
+
+	remoteAddr, _ := net.ResolveTCPAddr("tcp", r.RemoteAddr)
+	localAddr, _ := net.ResolveTCPAddr("tcp", r.Host)
+	if remoteAddr == nil {
+		remoteAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+	}
+	if localAddr == nil {
+		localAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+	}
+
+	conn := &splitConn{
+		reader: httpSC,
+		writer: httpSC,
+		remote: remoteAddr,
+		local:  localAddr,
+	}
+	defer conn.Close()
+
+	go h.tunnel.HandleTCPConn(inbound.NewSocket(socks5.ParseAddr("0.0.0.0:0"), conn, C.HTTPS, h.additions...))
+
+	select {
+	case <-r.Context().Done():
+	case <-httpSC.Wait():
+	}
+}
+
 func (h *requestHandler) applyResponseHeaders(w http.ResponseWriter) {
 	if !h.config.NoGRPCHeader {
 		w.Header().Set("Content-Type", "application/grpc")
@@ -318,23 +359,6 @@ func (h *requestHandler) handleDownload(w http.ResponseWriter, r *http.Request, 
 		f.Flush()
 	}
 
-	var keepAliveTicker *time.Ticker
-	var keepAliveInterval time.Duration
-	if !h.config.ScStreamUpServerSecs.IsZero() {
-		secs := h.config.ScStreamUpServerSecs.Random()
-		if secs > 0 {
-			keepAliveInterval = time.Duration(secs) * time.Second
-			keepAliveTicker = time.NewTicker(keepAliveInterval)
-			defer keepAliveTicker.Stop()
-		}
-	}
-
-	pollTicker := time.NewTicker(DefaultPollInterval)
-	defer pollTicker.Stop()
-
-	keepAliveByte := []byte{0x00}
-	lastActivity := time.Now()
-
 	for {
 		select {
 		case data, ok := <-session.downloadQueue:
@@ -343,7 +367,6 @@ func (h *requestHandler) handleDownload(w http.ResponseWriter, r *http.Request, 
 				return
 			}
 			session.touch(h.idleTimeout)
-			lastActivity = time.Now()
 			if _, writeErr := w.Write(data); writeErr != nil {
 				log.Debugln("xhttp: download write error: %v", writeErr)
 				h.closeAndDeleteSession(sessionID, session)
@@ -357,20 +380,6 @@ func (h *requestHandler) handleDownload(w http.ResponseWriter, r *http.Request, 
 			log.Debugln("xhttp: client disconnected, closing session %s", sessionID)
 			h.closeAndDeleteSession(sessionID, session)
 			return
-
-		case <-pollTicker.C:
-			if keepAliveTicker != nil && time.Since(lastActivity) >= keepAliveInterval {
-				if _, writeErr := w.Write(keepAliveByte); writeErr != nil {
-					log.Debugln("xhttp: keep-alive write error: %v", writeErr)
-					h.closeAndDeleteSession(sessionID, session)
-					return
-				}
-				session.touch(h.idleTimeout)
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
-				lastActivity = time.Now()
-			}
 		}
 	}
 }
@@ -469,25 +478,27 @@ func (h *requestHandler) handleStreamUpload(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if referrer := r.Header.Get("Referer"); referrer != "" && !h.config.ScStreamUpServerSecs.IsZero() {
-		if secs := h.config.ScStreamUpServerSecs.Random(); secs > 0 {
-			go func(interval time.Duration) {
-				ticker := time.NewTicker(interval)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-httpSC.Wait():
-						return
-					case <-r.Context().Done():
-						return
-					case <-ticker.C:
-						_, writeErr := httpSC.Write([]byte{'X'})
-						if writeErr != nil {
+	if !closeWhenDone {
+		if referrer := r.Header.Get("Referer"); referrer != "" && !h.config.ScStreamUpServerSecs.IsZero() {
+			if secs := h.config.ScStreamUpServerSecs.Random(); secs > 0 {
+				go func(interval time.Duration) {
+					ticker := time.NewTicker(interval)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-httpSC.Wait():
 							return
+						case <-r.Context().Done():
+							return
+						case <-ticker.C:
+							_, writeErr := httpSC.Write([]byte{'X'})
+							if writeErr != nil {
+								return
+							}
 						}
 					}
-				}
-			}(time.Duration(secs) * time.Second)
+				}(time.Duration(secs) * time.Second)
+			}
 		}
 	}
 
@@ -615,8 +626,16 @@ func NewHTTP3Server(config *Config, tunnel C.Tunnel, additions []inbound.Additio
 		idleTimeout:          DefaultSessionIdleTimeout,
 		connectedIdleTimeout: deriveConnectedIdleTimeout(DefaultSessionIdleTimeout),
 	}
+	weakNetwork := config.H3WeakNetwork
 	quicCfg := &quic.Config{
-		MaxIdleTimeout: 60 * 1000000000,
+		InitialStreamReceiveWindow:     DefaultH3InitStreamReceiveWindow,
+		MaxStreamReceiveWindow:         DefaultH3MaxStreamReceiveWindow,
+		InitialConnectionReceiveWindow: DefaultH3InitConnReceiveWindow,
+		MaxConnectionReceiveWindow:     DefaultH3MaxConnReceiveWindow,
+		KeepAlivePeriod:                resolveH3KeepAlive(0, weakNetwork),
+		MaxIdleTimeout:                 resolveH3MaxIdleTimeout(0, weakNetwork),
+		DisablePathMTUDiscovery:        weakNetwork,
+		MaxIncomingStreams:             1024,
 	}
 	return &http3.Server{
 		Handler:         handler,

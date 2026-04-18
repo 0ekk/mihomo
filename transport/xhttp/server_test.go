@@ -499,8 +499,9 @@ func TestServeHTTP(t *testing.T) {
 	})
 
 	t.Run("POST stream upload", func(t *testing.T) {
+		streamSessionID := uuid.Must(uuid.NewV4()).String()
 		body := strings.NewReader("stream data")
-		req := httptest.NewRequest("POST", "http://example.com/xhttp/"+sessionID, body)
+		req := httptest.NewRequest("POST", "http://example.com/xhttp/"+streamSessionID, body)
 		req.Host = "example.com"
 		req.Header.Set("Referer", withPadding("http://example.com/", 128))
 		w := httptest.NewRecorder()
@@ -536,8 +537,9 @@ func TestServeHTTP(t *testing.T) {
 	})
 
 	t.Run("POST packet upload", func(t *testing.T) {
+		packetSessionID := uuid.Must(uuid.NewV4()).String()
 		body := bytes.NewReader([]byte("packet"))
-		req := httptest.NewRequest("POST", "http://example.com/xhttp/"+sessionID+"/0", body)
+		req := httptest.NewRequest("POST", "http://example.com/xhttp/"+packetSessionID+"/0", body)
 		req.Host = "example.com"
 		req.Header.Set("Referer", withPadding("http://example.com/", 128))
 		w := httptest.NewRecorder()
@@ -549,8 +551,42 @@ func TestServeHTTP(t *testing.T) {
 		}
 	})
 
-	session, _ := handler.getOrCreateSession(sessionID)
-	session.uploadQueue.Close()
+	handler.sessions.Range(func(_, value any) bool {
+		session, ok := value.(*httpSession)
+		if ok && session != nil && session.uploadQueue != nil {
+			_ = session.uploadQueue.Close()
+		}
+		return true
+	})
+}
+
+func TestServeHTTPStreamOneBasePathDoesNotCreateSession(t *testing.T) {
+	cfg := &Config{
+		Host: "example.com",
+		Path: "/xhttp/",
+	}
+	cfg.normalize()
+	handler := &requestHandler{config: cfg}
+
+	body := strings.NewReader("stream-one data")
+	req := httptest.NewRequest("POST", "http://example.com/xhttp/", body)
+	req.Host = "example.com"
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Status = %v, want %v", w.Code, http.StatusOK)
+	}
+
+	count := 0
+	handler.sessions.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	if count != 0 {
+		t.Fatalf("stream-one base-path should not create session, got %d", count)
+	}
 }
 
 func TestServeHTTPStreamOneBasePathDoesNotCreateSession(t *testing.T) {

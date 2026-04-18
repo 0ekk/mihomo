@@ -18,6 +18,7 @@ import (
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/httptrace"
 	"github.com/metacubex/mihomo/log"
+	tuicCommon "github.com/metacubex/mihomo/transport/tuic/common"
 	"github.com/metacubex/quic-go"
 	http3 "github.com/metacubex/quic-go/http3"
 	"github.com/metacubex/tls"
@@ -180,7 +181,7 @@ func prepareEndpoint(cfg *Config, opts Options, sessionID string, isDownload boo
 	key := fmt.Sprintf("%s|%s|%s|%s|%t", opts.Address, host, cfg.Path, httpVersion, isDownload)
 
 	slot, err := acquireClient(key, xmuxCfg, func() (*clientSlot, error) {
-		client, transport, err := newHTTPClient(httpVersion, func(ctx context.Context, network string) (net.Conn, error) {
+		client, transport, err := newHTTPClient(httpVersion, cfg, func(ctx context.Context, network string) (net.Conn, error) {
 			target := "tcp"
 			if network != "" {
 				target = network
@@ -216,11 +217,10 @@ func prepareEndpoint(cfg *Config, opts Options, sessionID string, isDownload boo
 }
 
 func dialStreamOne(ctx context.Context, cancel context.CancelFunc, ep *endpoint) (net.Conn, error) {
-	pr, pw := io.Pipe()
-	// Isolate POST request from parent context cancellation using withoutCancel
-	// This ensures the upload won't be interrupted by parent timeout/cancellation
-	// similar to Xray's implementation
+	// Isolate POST request from parent context cancellation using withoutCancel,
+	// so long-lived stream-one upload is not interrupted by parent timeout/cancel.
 	postCtx, cancelPost := context.WithCancel(withoutCancel(ctx))
+	pr, pw := io.Pipe()
 	req, err := http.NewRequestWithContext(postCtx, http.MethodPost, ep.url.String(), pr)
 	if err != nil {
 		cancelPost()
@@ -343,17 +343,12 @@ func dialPacketUp(ctx context.Context, cancel context.CancelFunc, uploadEP, down
 	}
 
 	pr, pw := io.Pipe()
-	maxPostBytes := int(uploadEP.cfg.ScMaxEachPostBytes.Random())
-	if maxPostBytes <= 0 {
-		maxPostBytes = 1024 * 1024
-	}
+	maxPostBytes := normalizePacketUpMaxPostBytes(int(uploadEP.cfg.ScMaxEachPostBytes.Random()), uploadEP.httpVersion, uploadEP.cfg.H3WeakNetwork)
 	flushEvery := 2 * time.Millisecond
 	if cfgInterval := time.Duration(uploadEP.cfg.ScMinPostsIntervalMs.Random()) * time.Millisecond; cfgInterval > flushEvery {
 		flushEvery = cfgInterval
 	}
-	if flushEvery > 15*time.Millisecond {
-		flushEvery = 15 * time.Millisecond
-	}
+	flushEvery = normalizePacketUpFlushEvery(flushEvery, uploadEP.httpVersion, uploadEP.cfg.H3WeakNetwork)
 	writer := newPacketBatchWriter(pw, maxPostBytes, flushEvery)
 
 	uploadDone := make(chan error, 1)
@@ -387,21 +382,17 @@ func dialPacketUp(ctx context.Context, cancel context.CancelFunc, uploadEP, down
 func handleUploads(ctx context.Context, ep *endpoint, reader *io.PipeReader, downloadBody io.ReadCloser) error {
 	defer reader.Close()
 	startedAt := time.Now()
-	maxPostBytes := int(ep.cfg.ScMaxEachPostBytes.Random())
-	if maxPostBytes <= 0 {
-		maxPostBytes = 1024 * 1024
-	}
+	weakNetwork := ep.cfg != nil && ep.cfg.H3WeakNetwork
+	maxPostBytes := normalizePacketUpMaxPostBytes(int(ep.cfg.ScMaxEachPostBytes.Random()), ep.httpVersion, weakNetwork)
 	buf := make([]byte, maxPostBytes)
 	seq := int64(0)
-	interval := time.Duration(ep.cfg.ScMinPostsIntervalMs.Random()) * time.Millisecond
+	interval := normalizePacketUpInterval(time.Duration(ep.cfg.ScMinPostsIntervalMs.Random())*time.Millisecond, ep.httpVersion, weakNetwork)
 	lastPostStart := time.Time{}
 	basePath := strings.TrimSuffix(ep.url.Path, "/")
-	maxInFlight := int(ep.cfg.ScMaxBufferedPosts.Random())
-	if maxInFlight <= 0 {
-		maxInFlight = DefaultMaxPackets
-	}
+	maxInFlight := normalizePacketUpMaxInFlight(int(ep.cfg.ScMaxBufferedPosts.Random()), ep.httpVersion, weakNetwork)
 	inFlight := make(chan struct{}, maxInFlight)
 	errCh := make(chan error, 1)
+	maxUploadAttempts, retryBackoff := uploadRetryProfile(ep.httpVersion, weakNetwork)
 	const progressLogEvery = int64(256)
 	queuedPackets := int64(0)
 	queuedBytes := int64(0)
@@ -438,9 +429,6 @@ func handleUploads(ctx context.Context, ep *endpoint, reader *io.PipeReader, dow
 		go func() {
 			defer postWG.Done()
 			defer func() { <-inFlight }()
-
-			const maxUploadAttempts = 2
-			const retryBackoff = 60 * time.Millisecond
 			var finalErr error
 
 			for attempt := 1; attempt <= maxUploadAttempts; attempt++ {
@@ -567,6 +555,225 @@ func minPostIntervalWait(interval time.Duration, lastPostStart, now time.Time) t
 		return 0
 	}
 	return interval - elapsed
+}
+
+func normalizePacketUpMaxPostBytes(maxPostBytes int, httpVersion string, weakNetwork bool) int {
+	if maxPostBytes <= 0 {
+		maxPostBytes = 1024 * 1024
+	}
+	if httpVersion != "3" {
+		return maxPostBytes
+	}
+	capBytes := DefaultH3MaxPostBytes
+	if weakNetwork {
+		capBytes = DefaultH3WeakMaxPostBytes
+	}
+	if maxPostBytes > capBytes {
+		maxPostBytes = capBytes
+	}
+	if maxPostBytes < 8*1024 {
+		maxPostBytes = 8 * 1024
+	}
+	return maxPostBytes
+}
+
+func normalizePacketUpFlushEvery(flushEvery time.Duration, httpVersion string, weakNetwork bool) time.Duration {
+	if flushEvery <= 0 {
+		flushEvery = 2 * time.Millisecond
+	}
+	if httpVersion != "3" {
+		if flushEvery > 15*time.Millisecond {
+			return 15 * time.Millisecond
+		}
+		return flushEvery
+	}
+	if weakNetwork {
+		if flushEvery < 2*time.Millisecond {
+			return 2 * time.Millisecond
+		}
+		if flushEvery > DefaultH3WeakPacketFlushInterval {
+			return DefaultH3WeakPacketFlushInterval
+		}
+		return flushEvery
+	}
+	if flushEvery < time.Millisecond {
+		return time.Millisecond
+	}
+	if flushEvery > DefaultH3PacketFlushInterval {
+		return DefaultH3PacketFlushInterval
+	}
+	return flushEvery
+}
+
+func normalizePacketUpInterval(interval time.Duration, httpVersion string, weakNetwork bool) time.Duration {
+	if httpVersion != "3" {
+		return interval
+	}
+	if interval <= 0 {
+		if weakNetwork {
+			return DefaultH3WeakMinPostInterval
+		}
+		return DefaultH3MinPostInterval
+	}
+	if weakNetwork {
+		if interval < DefaultH3WeakMinPostInterval {
+			return DefaultH3WeakMinPostInterval
+		}
+		if interval > 20*time.Millisecond {
+			return 20 * time.Millisecond
+		}
+		return interval
+	}
+	if interval < 2*time.Millisecond {
+		return 2 * time.Millisecond
+	}
+	if interval > 12*time.Millisecond {
+		return 12 * time.Millisecond
+	}
+	return interval
+}
+
+func normalizePacketUpMaxInFlight(maxInFlight int, httpVersion string, weakNetwork bool) int {
+	if maxInFlight <= 0 {
+		maxInFlight = DefaultMaxPackets
+	}
+	if httpVersion != "3" {
+		return maxInFlight
+	}
+	minInFlight := DefaultH3MinInFlightPosts
+	if weakNetwork {
+		minInFlight = DefaultH3WeakMinInFlightPosts
+	}
+	if maxInFlight < minInFlight {
+		maxInFlight = minInFlight
+	}
+	if maxInFlight > 256 {
+		maxInFlight = 256
+	}
+	return maxInFlight
+}
+
+func uploadRetryProfile(httpVersion string, weakNetwork bool) (int, time.Duration) {
+	if httpVersion != "3" {
+		return 2, 60 * time.Millisecond
+	}
+	if weakNetwork {
+		return DefaultH3UploadRetryAttempts + 1, DefaultH3UploadRetryBackoff + 40*time.Millisecond
+	}
+	return DefaultH3UploadRetryAttempts, DefaultH3UploadRetryBackoff
+}
+
+func resolveH3KeepAlive(keepAlive time.Duration, weakNetwork bool) time.Duration {
+	period := DefaultH3KeepAlivePeriod
+	if keepAlive > 0 && keepAlive < period {
+		period = keepAlive
+	}
+	if weakNetwork && period > 8*time.Second {
+		period = 8 * time.Second
+	}
+	if period <= 0 {
+		period = DefaultH3KeepAlivePeriod
+	}
+	return period
+}
+
+func resolveH3MaxIdleTimeout(keepAlive time.Duration, weakNetwork bool) time.Duration {
+	idle := DefaultH3MaxIdleTimeout
+	if keepAlive > 0 && keepAlive*2 > idle {
+		idle = keepAlive * 2
+	}
+	if weakNetwork && idle < time.Minute {
+		idle = time.Minute
+	}
+	return idle
+}
+
+func applyH3CongestionController(quicConn *quic.Conn, cfg *Config, weakNetwork bool) {
+	cc, cwnd := (&Config{}).resolvedH3Congestion()
+	if cfg != nil {
+		cc, cwnd = cfg.resolvedH3Congestion()
+	}
+
+	switch cc {
+	case "adaptive":
+		if setH3BrutalCongestion(quicConn, cfg, weakNetwork) {
+			return
+		}
+		log.Warnln("xhttp: h3 adaptive brutal unavailable, fallback to bbr")
+		tuicCommon.SetCongestionController(quicConn, "bbr", cwnd)
+		log.Debugln("xhttp: h3 congestion=bbr source=adaptive-fallback cwnd=%d", cwnd)
+	case "brutal":
+		if setH3BrutalCongestion(quicConn, cfg, weakNetwork) {
+			return
+		}
+		log.Warnln("xhttp: h3 brutal unavailable, fallback to bbr")
+		tuicCommon.SetCongestionController(quicConn, "bbr", cwnd)
+		log.Debugln("xhttp: h3 congestion=bbr source=brutal-fallback cwnd=%d", cwnd)
+	default:
+		tuicCommon.SetCongestionController(quicConn, cc, cwnd)
+		log.Debugln("xhttp: h3 congestion=%s cwnd=%d", cc, cwnd)
+	}
+}
+
+func setH3BrutalCongestion(quicConn *quic.Conn, cfg *Config, weakNetwork bool) bool {
+	sendBPS := resolveH3BrutalSendBPS(cfg, weakNetwork)
+	if sendBPS == 0 {
+		return false
+	}
+	if !tuicCommon.SetBrutalCongestionController(quicConn, sendBPS) {
+		return false
+	}
+	log.Debugln("xhttp: h3 congestion=brutal send_bps=%d", sendBPS)
+	return true
+}
+
+func resolveH3BrutalSendBPS(cfg *Config, weakNetwork bool) uint64 {
+	maxPostBytes := DefaultH3MaxPostBytes
+	interval := DefaultH3MinPostInterval
+	if weakNetwork {
+		maxPostBytes = DefaultH3WeakMaxPostBytes
+		interval = DefaultH3WeakMinPostInterval
+	}
+
+	if cfg != nil {
+		postRange := cfg.ScMaxEachPostBytes.WithDefault(1_000_000, 1_000_000)
+		intervalRange := cfg.ScMinPostsIntervalMs.WithDefault(30, 30)
+
+		rawPost := int((postRange.From + postRange.To) / 2)
+		rawInterval := time.Duration((intervalRange.From+intervalRange.To)/2) * time.Millisecond
+
+		maxPostBytes = normalizePacketUpMaxPostBytes(rawPost, "3", weakNetwork)
+		interval = normalizePacketUpInterval(rawInterval, "3", weakNetwork)
+	}
+
+	if interval <= 0 {
+		if weakNetwork {
+			interval = DefaultH3WeakMinPostInterval
+		} else {
+			interval = DefaultH3MinPostInterval
+		}
+	}
+
+	sendBPS := uint64(maxPostBytes) * uint64(time.Second) / uint64(interval)
+	if sendBPS == 0 {
+		if weakNetwork {
+			sendBPS = DefaultH3WeakBrutalFallbackSendBPS
+		} else {
+			sendBPS = DefaultH3BrutalFallbackSendBPS
+		}
+	}
+
+	maxBPS := uint64(DefaultH3BrutalMaxSendBPS)
+	if weakNetwork {
+		maxBPS = uint64(DefaultH3WeakBrutalMaxSendBPS)
+	}
+	if sendBPS < uint64(DefaultH3BrutalMinSendBPS) {
+		sendBPS = uint64(DefaultH3BrutalMinSendBPS)
+	}
+	if sendBPS > maxBPS {
+		sendBPS = maxBPS
+	}
+	return sendBPS
 }
 
 type packetBatchWriter struct {
@@ -699,7 +906,7 @@ func doRequest(client *http.Client, req *http.Request) (*http.Response, net.Addr
 	return resp, remoteAddr, localAddr, nil
 }
 
-func newHTTPClient(httpVersion string, dial DialFunc, keepAlive time.Duration, tlsCfg *tls.Config, host string) (*http.Client, http.RoundTripper, error) {
+func newHTTPClient(httpVersion string, cfg *Config, dial DialFunc, keepAlive time.Duration, tlsCfg *tls.Config, host string) (*http.Client, http.RoundTripper, error) {
 	switch httpVersion {
 	case "3":
 		if tlsCfg == nil {
@@ -714,14 +921,20 @@ func newHTTPClient(httpVersion string, dial DialFunc, keepAlive time.Duration, t
 		if len(tlsCfg.NextProtos) == 0 {
 			tlsCfg.NextProtos = []string{"h3"}
 		}
+		weakNetwork := cfg != nil && cfg.H3WeakNetwork
 		quicCfg := &quic.Config{
-			KeepAlivePeriod: keepAlive,
-			MaxIdleTimeout:  keepAlive * 2,
+			InitialStreamReceiveWindow:     DefaultH3InitStreamReceiveWindow,
+			MaxStreamReceiveWindow:         DefaultH3MaxStreamReceiveWindow,
+			InitialConnectionReceiveWindow: DefaultH3InitConnReceiveWindow,
+			MaxConnectionReceiveWindow:     DefaultH3MaxConnReceiveWindow,
+			KeepAlivePeriod:                resolveH3KeepAlive(keepAlive, weakNetwork),
+			MaxIdleTimeout:                 resolveH3MaxIdleTimeout(keepAlive, weakNetwork),
+			DisablePathMTUDiscovery:        weakNetwork,
 		}
 		transport := &http3.Transport{
 			TLSClientConfig: tlsCfg,
 			QUICConfig:      quicCfg,
-			Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, quicCfg *quic.Config) (*quic.Conn, error) {
 				conn, err := dial(ctx, "udp")
 				if err != nil {
 					return nil, err
@@ -745,11 +958,12 @@ func newHTTPClient(httpVersion string, dial DialFunc, keepAlive time.Duration, t
 						return nil, err
 					}
 				}
-				quicConn, err := quic.DialEarly(ctx, packetConn, udpAddr, tlsCfg, cfg)
+				quicConn, err := quic.DialEarly(ctx, packetConn, udpAddr, tlsCfg, quicCfg)
 				if err != nil {
 					_ = conn.Close()
 					return nil, err
 				}
+				applyH3CongestionController(quicConn, cfg, weakNetwork)
 				return quicConn, nil
 			},
 		}

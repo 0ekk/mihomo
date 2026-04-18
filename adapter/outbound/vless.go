@@ -17,6 +17,7 @@ import (
 	"github.com/metacubex/mihomo/component/proxydialer"
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/gun"
 	"github.com/metacubex/mihomo/transport/vless"
 	"github.com/metacubex/mihomo/transport/vless/encryption"
@@ -185,11 +186,13 @@ func (v *Vless) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 		switch v.option.Flow {
 		case vless.XRV:
 			if metadata.DstPort == 443 {
-				err = fmt.Errorf("rejected UDP/443 traffic")
-				return
+				if log.Level() == log.DEBUG {
+					err = fmt.Errorf("rejected UDP/443 traffic")
+					return
+				}
 			}
 		case vless.XRVU:
-			
+
 		}
 		if v.option.PacketAddr {
 			metadata = &C.Metadata{

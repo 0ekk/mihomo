@@ -12,26 +12,29 @@ import (
 
 // Config holds SplitHTTP client settings.
 type Config struct {
-	Host                 string            `proxy:"host,omitempty" json:"host"`
-	Path                 string            `proxy:"path,omitempty" json:"path"`
-	HTTPVersion          string            `proxy:"http-version,omitempty" json:"http-version"`
-	Mode                 string            `proxy:"mode,omitempty" json:"mode"`
-	Headers              map[string]string `proxy:"headers,omitempty" json:"headers"`
-	NoGRPCHeader         bool              `proxy:"no-grpc-header,omitempty" json:"no-grpc-header"`
-	NoSSEHeader          bool              `proxy:"no-sse-header,omitempty" json:"no-sse-header"`
-	XPaddingBytes        Range             `proxy:"x-padding-bytes,omitempty" json:"x-padding-bytes"`
-	XPaddingObfsMode     bool              `proxy:"x-padding-obfs-mode,omitempty" json:"x-padding-obfs-mode"`
-	XPaddingKey          string            `proxy:"x-padding-key,omitempty" json:"x-padding-key"`
-	XPaddingHeader       string            `proxy:"x-padding-header,omitempty" json:"x-padding-header"`
-	XPaddingPlacement    string            `proxy:"x-padding-placement,omitempty" json:"x-padding-placement"`
-	XPaddingMethod       string            `proxy:"x-padding-method,omitempty" json:"x-padding-method"`
-	ScMaxEachPostBytes   Range             `proxy:"sc-max-each-post-bytes,omitempty" json:"sc-max-each-post-bytes"`
-	ScMinPostsIntervalMs Range             `proxy:"sc-min-posts-interval-ms,omitempty" json:"sc-min-posts-interval-ms"`
-	ScMaxBufferedPosts   Range             `proxy:"sc-max-buffered-posts,omitempty" json:"sc-max-buffered-posts"`
-	ScStreamUpServerSecs Range             `proxy:"sc-stream-up-server-secs,omitempty" json:"sc-stream-up-server-secs"`
-	Xmux                 *XmuxConfig       `proxy:"xmux,omitempty" json:"xmux"`
-	Download             *Config           `proxy:"download-settings,omitempty" json:"download-settings"`
-	ClientFingerprint    string            `proxy:"client-fingerprint,omitempty" json:"client-fingerprint"`
+	Host                   string            `proxy:"host,omitempty" json:"host"`
+	Path                   string            `proxy:"path,omitempty" json:"path"`
+	HTTPVersion            string            `proxy:"http-version,omitempty" json:"http-version"`
+	Mode                   string            `proxy:"mode,omitempty" json:"mode"`
+	H3CongestionController string            `proxy:"h3-congestion-controller,omitempty" json:"h3-congestion-controller"`
+	H3CWND                 int               `proxy:"h3-cwnd,omitempty" json:"h3-cwnd"`
+	H3WeakNetwork          bool              `proxy:"h3-weak-network,omitempty" json:"h3-weak-network"`
+	Headers                map[string]string `proxy:"headers,omitempty" json:"headers"`
+	NoGRPCHeader           bool              `proxy:"no-grpc-header,omitempty" json:"no-grpc-header"`
+	NoSSEHeader            bool              `proxy:"no-sse-header,omitempty" json:"no-sse-header"`
+	XPaddingBytes          Range             `proxy:"x-padding-bytes,omitempty" json:"x-padding-bytes"`
+	XPaddingObfsMode       bool              `proxy:"x-padding-obfs-mode,omitempty" json:"x-padding-obfs-mode"`
+	XPaddingKey            string            `proxy:"x-padding-key,omitempty" json:"x-padding-key"`
+	XPaddingHeader         string            `proxy:"x-padding-header,omitempty" json:"x-padding-header"`
+	XPaddingPlacement      string            `proxy:"x-padding-placement,omitempty" json:"x-padding-placement"`
+	XPaddingMethod         string            `proxy:"x-padding-method,omitempty" json:"x-padding-method"`
+	ScMaxEachPostBytes     Range             `proxy:"sc-max-each-post-bytes,omitempty" json:"sc-max-each-post-bytes"`
+	ScMinPostsIntervalMs   Range             `proxy:"sc-min-posts-interval-ms,omitempty" json:"sc-min-posts-interval-ms"`
+	ScMaxBufferedPosts     Range             `proxy:"sc-max-buffered-posts,omitempty" json:"sc-max-buffered-posts"`
+	ScStreamUpServerSecs   Range             `proxy:"sc-stream-up-server-secs,omitempty" json:"sc-stream-up-server-secs"`
+	Xmux                   *XmuxConfig       `proxy:"xmux,omitempty" json:"xmux"`
+	Download               *Config           `proxy:"download-settings,omitempty" json:"download-settings"`
+	ClientFingerprint      string            `proxy:"client-fingerprint,omitempty" json:"client-fingerprint"`
 
 	internalTLS *tls.Config `proxy:"-" json:"-"`
 }
@@ -92,6 +95,15 @@ func defaultConfig() *Config {
 func (c *Config) normalize() {
 	if c == nil {
 		return
+	}
+	c.H3CongestionController = strings.ToLower(strings.TrimSpace(c.H3CongestionController))
+	switch c.H3CongestionController {
+	case "", "adaptive", "brutal", "bbr", "bbr_meta_v1", "bbr_meta_v2", "cubic", "new_reno":
+	default:
+		c.H3CongestionController = ""
+	}
+	if c.H3CWND < 0 {
+		c.H3CWND = 0
 	}
 	c.Path = normalizePath(c.Path)
 	c.XPaddingBytes = c.XPaddingBytes.WithDefault(100, 1000)
@@ -209,6 +221,21 @@ func (c *Config) normalizedXmux() normalizedXmux {
 		return defaultXmux()
 	}
 	return c.Xmux.normalized()
+}
+
+func (c *Config) resolvedH3Congestion() (string, int) {
+	cc := DefaultH3CongestionController
+	cwnd := DefaultH3CongestionCWND
+	if c == nil {
+		return cc, cwnd
+	}
+	if c.H3CongestionController != "" {
+		cc = c.H3CongestionController
+	}
+	if c.H3CWND > 0 {
+		cwnd = c.H3CWND
+	}
+	return cc, cwnd
 }
 
 type XmuxConfig struct {
