@@ -44,37 +44,39 @@ type Vless struct {
 
 	realityConfig *tlsC.RealityConfig
 	echConfig     *ech.Config
+	tlsFragment   *vmess.TLSFragmentConfig
 }
 
 type VlessOption struct {
 	BasicOption
-	Name              string            `proxy:"name"`
-	Server            string            `proxy:"server"`
-	Port              int               `proxy:"port"`
-	UUID              string            `proxy:"uuid"`
-	Flow              string            `proxy:"flow,omitempty"`
-	TLS               bool              `proxy:"tls,omitempty"`
-	ALPN              []string          `proxy:"alpn,omitempty"`
-	UDP               bool              `proxy:"udp,omitempty"`
-	PacketAddr        bool              `proxy:"packet-addr,omitempty"`
-	XUDP              bool              `proxy:"xudp,omitempty"`
-	PacketEncoding    string            `proxy:"packet-encoding,omitempty"`
-	Encryption        string            `proxy:"encryption,omitempty"`
-	Network           string            `proxy:"network,omitempty"`
-	ECHOpts           ECHOptions        `proxy:"ech-opts,omitempty"`
-	RealityOpts       RealityOptions    `proxy:"reality-opts,omitempty"`
-	HTTPOpts          HTTPOptions       `proxy:"http-opts,omitempty"`
-	HTTP2Opts         HTTP2Options      `proxy:"h2-opts,omitempty"`
-	GrpcOpts          GrpcOptions       `proxy:"grpc-opts,omitempty"`
-	WSOpts            WSOptions         `proxy:"ws-opts,omitempty"`
-	XHttpOpts         *xhttp.Config     `proxy:"xhttp-opts,omitempty"`
-	WSHeaders         map[string]string `proxy:"ws-headers,omitempty"`
-	SkipCertVerify    bool              `proxy:"skip-cert-verify,omitempty"`
-	Fingerprint       string            `proxy:"fingerprint,omitempty"`
-	Certificate       string            `proxy:"certificate,omitempty"`
-	PrivateKey        string            `proxy:"private-key,omitempty"`
-	ServerName        string            `proxy:"servername,omitempty"`
-	ClientFingerprint string            `proxy:"client-fingerprint,omitempty"`
+	Name              string             `proxy:"name"`
+	Server            string             `proxy:"server"`
+	Port              int                `proxy:"port"`
+	UUID              string             `proxy:"uuid"`
+	Flow              string             `proxy:"flow,omitempty"`
+	TLS               bool               `proxy:"tls,omitempty"`
+	ALPN              []string           `proxy:"alpn,omitempty"`
+	UDP               bool               `proxy:"udp,omitempty"`
+	PacketAddr        bool               `proxy:"packet-addr,omitempty"`
+	XUDP              bool               `proxy:"xudp,omitempty"`
+	PacketEncoding    string             `proxy:"packet-encoding,omitempty"`
+	Encryption        string             `proxy:"encryption,omitempty"`
+	Network           string             `proxy:"network,omitempty"`
+	ECHOpts           ECHOptions         `proxy:"ech-opts,omitempty"`
+	RealityOpts       RealityOptions     `proxy:"reality-opts,omitempty"`
+	HTTPOpts          HTTPOptions        `proxy:"http-opts,omitempty"`
+	HTTP2Opts         HTTP2Options       `proxy:"h2-opts,omitempty"`
+	GrpcOpts          GrpcOptions        `proxy:"grpc-opts,omitempty"`
+	WSOpts            WSOptions          `proxy:"ws-opts,omitempty"`
+	XHttpOpts         *xhttp.Config      `proxy:"xhttp-opts,omitempty"`
+	WSHeaders         map[string]string  `proxy:"ws-headers,omitempty"`
+	SkipCertVerify    bool               `proxy:"skip-cert-verify,omitempty"`
+	Fingerprint       string             `proxy:"fingerprint,omitempty"`
+	Certificate       string             `proxy:"certificate,omitempty"`
+	PrivateKey        string             `proxy:"private-key,omitempty"`
+	ServerName        string             `proxy:"servername,omitempty"`
+	ClientFingerprint string             `proxy:"client-fingerprint,omitempty"`
+	TLSFragment       TLSFragmentOptions `proxy:"tls-fragment,omitempty"`
 }
 
 func (v *Vless) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.Metadata) (_ net.Conn, err error) {
@@ -230,6 +232,7 @@ func (v *Vless) streamTLSConn(ctx context.Context, conn net.Conn, isH2 bool) (ne
 			ClientFingerprint: v.option.ClientFingerprint,
 			ECH:               v.echConfig,
 			Reality:           v.realityConfig,
+			TLSFragment:       v.tlsFragment,
 			NextProtos:        v.option.ALPN,
 		}
 
@@ -404,6 +407,7 @@ func (v *Vless) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
 				ClientFingerprint: clientFingerprint,
 				ECH:               v.echConfig,
 				Reality:           v.realityConfig,
+				TLSFragment:       v.tlsFragment,
 				NextProtos:        v.option.ALPN,
 			}
 			if httpVersion == "2" {
@@ -623,6 +627,11 @@ func NewVless(option VlessOption) (*Vless, error) {
 		return nil, err
 	}
 
+	v.tlsFragment, err = v.option.TLSFragment.Build()
+	if err != nil {
+		return nil, fmt.Errorf("invalid tls-fragment: %w", err)
+	}
+
 	switch option.Network {
 	case "h2":
 		if len(option.HTTP2Opts.Host) == 0 {
@@ -654,6 +663,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 				Certificate:       option.Certificate,
 				PrivateKey:        option.PrivateKey,
 				ClientFingerprint: option.ClientFingerprint,
+				TLSFragment:       v.tlsFragment,
 				NextProtos:        []string{"h2"},
 				ECH:               v.echConfig,
 				Reality:           v.realityConfig,
