@@ -195,11 +195,14 @@ func ResolvePadding(min, max *int, defMin, defMax int) (int, int) {
 }
 
 func NormalizeTableType(tableType string) (string, error) {
-	normalized, err := sudoku.NormalizeASCIIMode(tableType)
-	if err != nil {
-		return "", fmt.Errorf("table-type must be prefer_ascii, prefer_entropy, up_ascii_down_entropy, or up_entropy_down_ascii")
+	switch t := strings.ToLower(strings.TrimSpace(tableType)); t {
+	case "", "prefer_ascii":
+		return "prefer_ascii", nil
+	case "prefer_entropy":
+		return "prefer_entropy", nil
+	default:
+		return "", fmt.Errorf("table-type must be prefer_ascii or prefer_entropy")
 	}
-	return normalized, nil
 }
 
 func (c *ProtocolConfig) tableCandidates() []*sudoku.Table {

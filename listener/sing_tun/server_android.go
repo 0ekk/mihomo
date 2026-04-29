@@ -49,7 +49,8 @@ func getPackageManager() (tun.PackageManager, error) {
 func (l *Listener) buildAndroidRules(tunOptions *tun.Options) error {
 	packageManager, err := getPackageManager()
 	if err != nil {
-		return err
+		log.Warnln("[TUN] failed to initialize package manager, Android rules will not work: %v", err)
+		return nil
 	}
 	tunOptions.BuildAndroidRules(packageManager, l.handler)
 	return nil

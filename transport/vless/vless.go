@@ -9,10 +9,11 @@ import (
 )
 
 const (
-	XRO = "xtls-rprx-origin"
-	XRD = "xtls-rprx-direct"
-	XRS = "xtls-rprx-splice"
-	XRV = "xtls-rprx-vision"
+	XRO  = "xtls-rprx-origin"
+	XRD  = "xtls-rprx-direct"
+	XRS  = "xtls-rprx-splice"
+	XRV  = "xtls-rprx-vision"
+	XRVU = "xtls-rprx-vision-udp443"
 
 	Version byte = 0 // protocol version. preview version is 0
 )

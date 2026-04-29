@@ -72,10 +72,6 @@ type TunnelDialOptions struct {
 	// AuthKey enables short-term HMAC auth for HTTP tunnel requests (anti-probing).
 	// When set (non-empty), each HTTP request carries an Authorization bearer token derived from AuthKey.
 	AuthKey string
-	// EarlyHandshake folds the protocol handshake into the HTTP/WS setup round trip.
-	// When the server accepts the early payload, DialTunnel returns a conn that is already post-handshake.
-	// When the server does not echo early data, DialTunnel falls back to Upgrade.
-	EarlyHandshake *ClientEarlyHandshake
 	// Upgrade optionally wraps the raw tunnel conn and/or writes a small prelude before DialTunnel returns.
 	// It is called with the raw tunnel conn; if it returns a non-nil conn, that conn is returned by DialTunnel.
 	Upgrade func(raw net.Conn) (net.Conn, error)
@@ -229,11 +225,30 @@ func canonicalHeaderHost(urlHost, scheme string) string {
 }
 
 func parseTunnelToken(body []byte) (string, error) {
-	resp, err := parseAuthorizeResponse(body)
-	if err != nil {
-		return "", err
+	s := strings.TrimSpace(string(body))
+	idx := strings.Index(s, "token=")
+	if idx < 0 {
+		return "", errors.New("missing token")
 	}
-	return resp.token, nil
+	s = s[idx+len("token="):]
+	if s == "" {
+		return "", errors.New("empty token")
+	}
+	// Token is base64.RawURLEncoding (A-Z a-z 0-9 - _). Strip any trailing bytes (e.g. from CDN compression).
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' {
+			b.WriteByte(c)
+			continue
+		}
+		break
+	}
+	token := b.String()
+	if token == "" {
+		return "", errors.New("empty token")
+	}
+	return token, nil
 }
 
 type httpClientTarget struct {
@@ -338,13 +353,6 @@ func dialSessionWithClient(ctx context.Context, client *http.Client, target http
 
 	auth := newTunnelAuth(opts.AuthKey, 0)
 	authorizeURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: joinPathRoot(opts.PathRoot, "/session")}).String()
-	if opts.EarlyHandshake != nil && len(opts.EarlyHandshake.RequestPayload) > 0 {
-		var err error
-		authorizeURL, err = setEarlyDataQuery(authorizeURL, opts.EarlyHandshake.RequestPayload)
-		if err != nil {
-			return nil, err
-		}
-	}
 
 	var bodyBytes []byte
 	for attempt := 0; ; attempt++ {
@@ -402,18 +410,12 @@ func dialSessionWithClient(ctx context.Context, client *http.Client, target http
 		break
 	}
 
-	authResp, err := parseAuthorizeResponse(bodyBytes)
+	token, err := parseTunnelToken(bodyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("%s authorize failed: %q", mode, strings.TrimSpace(string(bodyBytes)))
 	}
-	token := authResp.token
 	if token == "" {
 		return nil, fmt.Errorf("%s authorize empty token", mode)
-	}
-	if opts.EarlyHandshake != nil && len(authResp.earlyPayload) > 0 && opts.EarlyHandshake.HandleResponse != nil {
-		if err := opts.EarlyHandshake.HandleResponse(authResp.earlyPayload); err != nil {
-			return nil, err
-		}
 	}
 
 	pushURL := (&url.URL{Scheme: target.scheme, Host: target.urlHost, Path: joinPathRoot(opts.PathRoot, "/api/v1/upload"), RawQuery: "token=" + url.QueryEscape(token)}).String()
@@ -669,10 +671,16 @@ func dialStreamSplitWithClient(ctx context.Context, client *http.Client, target 
 	if c == nil {
 		return nil, fmt.Errorf("failed to build stream split conn")
 	}
-	outConn, err := applyEarlyHandshakeOrUpgrade(c, opts)
-	if err != nil {
-		_ = c.Close()
-		return nil, err
+	outConn := net.Conn(c)
+	if opts.Upgrade != nil {
+		upgraded, err := opts.Upgrade(c)
+		if err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+		if upgraded != nil {
+			outConn = upgraded
+		}
 	}
 	return outConn, nil
 }
@@ -686,10 +694,16 @@ func dialStreamSplit(ctx context.Context, serverAddress string, opts TunnelDialO
 	if c == nil {
 		return nil, fmt.Errorf("failed to build stream split conn")
 	}
-	outConn, err := applyEarlyHandshakeOrUpgrade(c, opts)
-	if err != nil {
-		_ = c.Close()
-		return nil, err
+	outConn := net.Conn(c)
+	if opts.Upgrade != nil {
+		upgraded, err := opts.Upgrade(c)
+		if err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+		if upgraded != nil {
+			outConn = upgraded
+		}
 	}
 	return outConn, nil
 }
@@ -1106,10 +1120,16 @@ func dialPollWithClient(ctx context.Context, client *http.Client, target httpCli
 	if c == nil {
 		return nil, fmt.Errorf("failed to build poll conn")
 	}
-	outConn, err := applyEarlyHandshakeOrUpgrade(c, opts)
-	if err != nil {
-		_ = c.Close()
-		return nil, err
+	outConn := net.Conn(c)
+	if opts.Upgrade != nil {
+		upgraded, err := opts.Upgrade(c)
+		if err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+		if upgraded != nil {
+			outConn = upgraded
+		}
 	}
 	return outConn, nil
 }
@@ -1123,10 +1143,16 @@ func dialPoll(ctx context.Context, serverAddress string, opts TunnelDialOptions)
 	if c == nil {
 		return nil, fmt.Errorf("failed to build poll conn")
 	}
-	outConn, err := applyEarlyHandshakeOrUpgrade(c, opts)
-	if err != nil {
-		_ = c.Close()
-		return nil, err
+	outConn := net.Conn(c)
+	if opts.Upgrade != nil {
+		upgraded, err := opts.Upgrade(c)
+		if err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+		if upgraded != nil {
+			outConn = upgraded
+		}
 	}
 	return outConn, nil
 }
@@ -1502,8 +1528,6 @@ type TunnelServerOptions struct {
 	PullReadTimeout time.Duration
 	// SessionTTL is a best-effort TTL to prevent leaked sessions. 0 uses a conservative default.
 	SessionTTL time.Duration
-	// EarlyHandshake optionally folds the protocol handshake into the initial HTTP/WS round trip.
-	EarlyHandshake *TunnelServerEarlyHandshake
 }
 
 type TunnelServer struct {
@@ -1514,7 +1538,6 @@ type TunnelServer struct {
 
 	pullReadTimeout time.Duration
 	sessionTTL      time.Duration
-	earlyHandshake  *TunnelServerEarlyHandshake
 
 	mu       sync.Mutex
 	sessions map[string]*tunnelSession
@@ -1547,7 +1570,6 @@ func NewTunnelServer(opts TunnelServerOptions) *TunnelServer {
 		passThroughOnReject: opts.PassThroughOnReject,
 		pullReadTimeout:     timeout,
 		sessionTTL:          ttl,
-		earlyHandshake:      opts.EarlyHandshake,
 		sessions:            make(map[string]*tunnelSession),
 	}
 }
@@ -1903,12 +1925,9 @@ func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, he
 
 	switch strings.ToUpper(req.method) {
 	case http.MethodGet:
+		// Stream split-session: GET /session (no token) => token + start tunnel on a server-side pipe.
 		if token == "" && path == "/session" {
-			earlyPayload, err := parseEarlyDataQuery(u)
-			if err != nil {
-				return rejectOrReply(http.StatusBadRequest, "bad request")
-			}
-			return s.sessionAuthorize(rawConn, earlyPayload)
+			return s.sessionAuthorize(rawConn)
 		}
 		// Stream split-session: GET /stream?token=... => downlink poll.
 		if token != "" && path == "/stream" {
@@ -2026,18 +2045,10 @@ func writeSimpleHTTPResponse(w io.Writer, code int, body string) error {
 
 func writeTokenHTTPResponse(w io.Writer, token string) error {
 	token = strings.TrimRight(token, "\r\n")
-	return writeTokenHTTPResponseWithEarlyData(w, token, nil)
-}
-
-func writeTokenHTTPResponseWithEarlyData(w io.Writer, token string, earlyPayload []byte) error {
-	token = strings.TrimRight(token, "\r\n")
-	body := "token=" + token
-	if len(earlyPayload) > 0 {
-		body += "\ned=" + base64.RawURLEncoding.EncodeToString(earlyPayload)
-	}
+	// Use application/octet-stream to avoid CDN auto-compression (e.g. brotli) breaking clients that expect a plain token string.
 	_, err := io.WriteString(w,
-		fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nPragma: no-cache\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
-			len(body), body))
+		fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nPragma: no-cache\r\nContent-Length: %d\r\nConnection: close\r\n\r\ntoken=%s",
+			len("token=")+len(token), token))
 	return err
 }
 
@@ -2077,11 +2088,7 @@ func (s *TunnelServer) handlePoll(rawConn net.Conn, req *httpRequestHeader, head
 	switch strings.ToUpper(req.method) {
 	case http.MethodGet:
 		if token == "" && path == "/session" {
-			earlyPayload, err := parseEarlyDataQuery(u)
-			if err != nil {
-				return rejectOrReply(http.StatusBadRequest, "bad request")
-			}
-			return s.sessionAuthorize(rawConn, earlyPayload)
+			return s.sessionAuthorize(rawConn)
 		}
 		if token != "" && path == "/stream" {
 			if s.passThroughOnReject && !s.sessionHas(token) {
@@ -2121,7 +2128,7 @@ func (s *TunnelServer) handlePoll(rawConn net.Conn, req *httpRequestHeader, head
 	}
 }
 
-func (s *TunnelServer) sessionAuthorize(rawConn net.Conn, earlyPayload []byte) (HandleResult, net.Conn, error) {
+func (s *TunnelServer) sessionAuthorize(rawConn net.Conn) (HandleResult, net.Conn, error) {
 	token, err := newSessionToken()
 	if err != nil {
 		_ = writeSimpleHTTPResponse(rawConn, http.StatusInternalServerError, "internal error")
@@ -2130,37 +2137,6 @@ func (s *TunnelServer) sessionAuthorize(rawConn net.Conn, earlyPayload []byte) (
 	}
 
 	c1, c2 := newHalfPipe()
-	outConn := net.Conn(c1)
-	var responsePayload []byte
-	var userHash string
-	if len(earlyPayload) > 0 && s.earlyHandshake != nil && s.earlyHandshake.Prepare != nil {
-		prepared, err := s.earlyHandshake.Prepare(earlyPayload)
-		if err != nil {
-			_ = c1.Close()
-			_ = c2.Close()
-			if s.passThroughOnReject {
-				return HandlePassThrough, newRejectedPreBufferedConn(rawConn, nil), nil
-			}
-			_ = writeSimpleHTTPResponse(rawConn, http.StatusNotFound, "not found")
-			_ = rawConn.Close()
-			return HandleDone, nil, nil
-		}
-		responsePayload = prepared.ResponsePayload
-		userHash = prepared.UserHash
-		if prepared.WrapConn != nil {
-			wrapped, err := prepared.WrapConn(c1)
-			if err != nil {
-				_ = c1.Close()
-				_ = c2.Close()
-				_ = writeSimpleHTTPResponse(rawConn, http.StatusInternalServerError, "internal error")
-				_ = rawConn.Close()
-				return HandleDone, nil, nil
-			}
-			if wrapped != nil {
-				outConn = wrapEarlyHandshakeConn(wrapped, userHash)
-			}
-		}
-	}
 
 	s.mu.Lock()
 	s.sessions[token] = &tunnelSession{conn: c2, lastActive: time.Now()}
@@ -2168,9 +2144,9 @@ func (s *TunnelServer) sessionAuthorize(rawConn net.Conn, earlyPayload []byte) (
 
 	go s.reapLater(token)
 
-	_ = writeTokenHTTPResponseWithEarlyData(rawConn, token, responsePayload)
+	_ = writeTokenHTTPResponse(rawConn, token)
 	_ = rawConn.Close()
-	return HandleStartTunnel, outConn, nil
+	return HandleStartTunnel, c1, nil
 }
 
 func newSessionToken() (string, error) {

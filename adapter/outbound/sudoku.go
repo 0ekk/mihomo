@@ -36,7 +36,7 @@ type SudokuOption struct {
 	AEADMethod         string                 `proxy:"aead-method,omitempty"`
 	PaddingMin         *int                   `proxy:"padding-min,omitempty"`
 	PaddingMax         *int                   `proxy:"padding-max,omitempty"`
-	TableType          string                 `proxy:"table-type,omitempty"` // "prefer_ascii", "prefer_entropy", or directional "up_ascii_down_entropy"/"up_entropy_down_ascii"
+	TableType          string                 `proxy:"table-type,omitempty"` // "prefer_ascii" or "prefer_entropy"
 	EnablePureDownlink *bool                  `proxy:"enable-pure-downlink,omitempty"`
 	HTTPMask           *bool                  `proxy:"http-mask,omitempty"`
 	HTTPMaskMode       string                 `proxy:"http-mask-mode,omitempty"`      // "legacy" (default), "stream", "poll", "auto", "ws"
@@ -54,7 +54,7 @@ type SudokuHTTPMaskOptions struct {
 	Mode      string `proxy:"mode,omitempty"`
 	TLS       bool   `proxy:"tls,omitempty"`
 	Host      string `proxy:"host,omitempty"`
-	PathRoot  string `proxy:"path-root,omitempty"`
+	PathRoot  string `proxy:"path_root,omitempty"`
 	Multiplex string `proxy:"multiplex,omitempty"`
 }
 
@@ -223,18 +223,18 @@ func NewSudoku(option SudokuOption) (*Sudoku, error) {
 	}
 
 	outbound := &Sudoku{
-		Base: NewBase(BaseOption{
-			Name:         option.Name,
-			Addr:         baseConf.ServerAddress,
-			Type:         C.Sudoku,
-			ProviderName: option.ProviderName,
-			UDP:          true,
-			TFO:          option.TFO,
-			MPTCP:        option.MPTCP,
-			Interface:    option.Interface,
-			RoutingMark:  option.RoutingMark,
-			Prefer:       option.IPVersion,
-		}),
+		Base: &Base{
+			name:   option.Name,
+			addr:   baseConf.ServerAddress,
+			tp:     C.Sudoku,
+			pdName: option.ProviderName,
+			udp:    true,
+			tfo:    option.TFO,
+			mpTcp:  option.MPTCP,
+			iface:  option.Interface,
+			rmark:  option.RoutingMark,
+			prefer: option.IPVersion,
+		},
 		option:   &option,
 		baseConf: baseConf,
 	}

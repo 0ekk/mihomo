@@ -14,26 +14,20 @@ import (
 	"github.com/metacubex/mihomo/transport/sudoku/obfs/sudoku"
 )
 
-type clientTableChoice struct {
-	Table   *sudoku.Table
-	Hint    uint32
-	HasHint bool
-}
-
-func pickClientTable(cfg *ProtocolConfig) (clientTableChoice, error) {
+func pickClientTable(cfg *ProtocolConfig) (*sudoku.Table, error) {
 	candidates := cfg.tableCandidates()
 	if len(candidates) == 0 {
-		return clientTableChoice{}, fmt.Errorf("no table configured")
+		return nil, fmt.Errorf("no table configured")
 	}
 	if len(candidates) == 1 {
-		return clientTableChoice{Table: candidates[0], Hint: candidates[0].Hint()}, nil
+		return candidates[0], nil
 	}
 	var b [1]byte
 	if _, err := crand.Read(b[:]); err != nil {
-		return clientTableChoice{}, fmt.Errorf("random table pick failed: %w", err)
+		return nil, fmt.Errorf("random table pick failed: %w", err)
 	}
 	idx := int(b[0]) % len(candidates)
-	return clientTableChoice{Table: candidates[idx], Hint: candidates[idx].Hint(), HasHint: true}, nil
+	return candidates[idx], nil
 }
 
 type readOnlyConn struct {

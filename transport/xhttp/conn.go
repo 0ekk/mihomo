@@ -1,58 +1,52 @@
 package xhttp
 
 import (
-	"errors"
 	"io"
+	"net"
+	"sync"
 	"time"
-
-	"github.com/metacubex/mihomo/common/httputils"
 )
 
-type Conn struct {
-	writer  io.WriteCloser
-	reader  io.ReadCloser
-	onClose func()
-	httputils.NetAddr
-
-	// deadlines
-	deadline *time.Timer
+type splitConn struct {
+	writer    io.WriteCloser
+	reader    io.ReadCloser
+	remote    net.Addr
+	local     net.Addr
+	onClose   func()
+	closeOnce sync.Once
+	closeErr  error
 }
 
-func (c *Conn) Write(b []byte) (int, error) {
-	return c.writer.Write(b)
-}
-
-func (c *Conn) Read(b []byte) (int, error) {
+func (c *splitConn) Read(b []byte) (int, error) {
 	return c.reader.Read(b)
 }
 
-func (c *Conn) Close() error {
-	err := c.writer.Close()
-	err2 := c.reader.Close()
-	if c.onClose != nil {
-		c.onClose()
-	}
-	return errors.Join(err, err2)
+func (c *splitConn) Write(b []byte) (int, error) {
+	return c.writer.Write(b)
 }
 
-func (c *Conn) SetReadDeadline(t time.Time) error  { return c.SetDeadline(t) }
-func (c *Conn) SetWriteDeadline(t time.Time) error { return c.SetDeadline(t) }
-
-func (c *Conn) SetDeadline(t time.Time) error {
-	if t.IsZero() {
-		if c.deadline != nil {
-			c.deadline.Stop()
-			c.deadline = nil
+func (c *splitConn) Close() error {
+	c.closeOnce.Do(func() {
+		if c.onClose != nil {
+			c.onClose()
 		}
-		return nil
-	}
-	d := time.Until(t)
-	if c.deadline != nil {
-		c.deadline.Reset(d)
-		return nil
-	}
-	c.deadline = time.AfterFunc(d, func() {
-		c.Close()
+		err := c.writer.Close()
+		err2 := c.reader.Close()
+		if err != nil {
+			c.closeErr = err
+			return
+		}
+		c.closeErr = err2
 	})
+	return c.closeErr
+}
+
+func (c *splitConn) LocalAddr() net.Addr  { return c.local }
+func (c *splitConn) RemoteAddr() net.Addr { return c.remote }
+
+func (*splitConn) SetDeadline(t time.Time) error     { _ = t; return nil }
+func (*splitConn) SetReadDeadline(t time.Time) error { _ = t; return nil }
+func (*splitConn) SetWriteDeadline(t time.Time) error {
+	_ = t
 	return nil
 }

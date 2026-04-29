@@ -9,13 +9,16 @@ import (
 
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/ech"
+	"github.com/metacubex/mihomo/component/proxydialer"
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/gun"
 	"github.com/metacubex/mihomo/transport/shadowsocks/core"
 	"github.com/metacubex/mihomo/transport/trojan"
 	"github.com/metacubex/mihomo/transport/vmess"
+	"github.com/metacubex/mihomo/transport/xhttp"
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/tls"
@@ -27,7 +30,8 @@ type Trojan struct {
 	hexPassword [trojan.KeyLength]byte
 
 	// for gun mux
-	gunClient *gun.Client
+	gunConfig    *gun.Config
+	gunTransport *gun.TransportWrap
 
 	realityConfig *tlsC.RealityConfig
 	echConfig     *ech.Config
@@ -53,6 +57,7 @@ type TrojanOption struct {
 	RealityOpts       RealityOptions `proxy:"reality-opts,omitempty"`
 	GrpcOpts          GrpcOptions    `proxy:"grpc-opts,omitempty"`
 	WSOpts            WSOptions      `proxy:"ws-opts,omitempty"`
+	XHttpOpts         *xhttp.Config  `proxy:"xhttp-opts,omitempty"`
 	SSOpts            TrojanSSOption `proxy:"ss-opts,omitempty"`
 	ClientFingerprint string         `proxy:"client-fingerprint,omitempty"`
 }
@@ -115,7 +120,7 @@ func (t *Trojan) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.
 
 		c, err = vmess.StreamWebsocketConn(ctx, c, wsOpts)
 	case "grpc":
-		break // already handle in dialContext
+		break // already handle in gun transport
 	default:
 		// default tcp network
 		// handle TLS
@@ -136,7 +141,7 @@ func (t *Trojan) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.
 		})
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s connect error: %w", t.addr, err)
 	}
 
 	return t.streamConnContext(ctx, c, metadata)
@@ -172,18 +177,38 @@ func (t *Trojan) writeHeaderContext(ctx context.Context, c net.Conn, metadata *C
 	return err
 }
 
-func (t *Trojan) dialContext(ctx context.Context) (c net.Conn, err error) {
-	switch t.option.Network {
-	case "grpc": // gun transport
-		return t.gunClient.Dial()
-	default:
-	}
-	return t.dialer.DialContext(ctx, "tcp", t.addr)
-}
-
 // DialContext implements C.ProxyAdapter
 func (t *Trojan) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
-	c, err := t.dialContext(ctx)
+	return t.DialContextWithDialer(ctx, dialer.NewDialer(t.DialOptions()...), metadata)
+}
+
+// DialContextWithDialer implements C.ProxyAdapter
+func (t *Trojan) DialContextWithDialer(ctx context.Context, dialer C.Dialer, metadata *C.Metadata) (_ C.Conn, err error) {
+	if len(t.option.DialerProxy) > 0 {
+		dialer = proxydialer.NewByName(t.option.DialerProxy)
+	}
+
+	var c net.Conn
+
+	if t.option.Network == "xhttp" {
+		c, err = t.dialXHTTP(ctx, dialer)
+		if err != nil {
+			return nil, err
+		}
+		defer func(conn net.Conn) {
+			safeConnClose(conn, err)
+		}(c)
+		c, err = t.streamConnContext(ctx, c, metadata)
+		if err != nil {
+			return nil, err
+		}
+		return NewConn(c, t), nil
+	} else if t.gunTransport != nil {
+		c, err = gun.StreamGunWithTransport(t.gunTransport, t.gunConfig)
+	} else {
+		c, err = dialer.DialContext(ctx, "tcp", t.addr)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %w", t.addr, err)
 	}
@@ -193,7 +218,7 @@ func (t *Trojan) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Con
 
 	c, err = t.StreamConnContext(ctx, c, metadata)
 	if err != nil {
-		return nil, fmt.Errorf("%s connect error: %w", t.addr, err)
+		return nil, err
 	}
 
 	return NewConn(c, t), err
@@ -205,7 +230,13 @@ func (t *Trojan) ListenPacketContext(ctx context.Context, metadata *C.Metadata) 
 		return nil, err
 	}
 
-	c, err := t.dialContext(ctx)
+	var c net.Conn
+	// grpc transport
+	if t.gunTransport != nil {
+		c, err = gun.StreamGunWithTransport(t.gunTransport, t.gunConfig)
+	} else {
+		c, err = t.dialer.DialContext(ctx, "tcp", t.addr)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %w", t.addr, err)
 	}
@@ -215,11 +246,96 @@ func (t *Trojan) ListenPacketContext(ctx context.Context, metadata *C.Metadata) 
 
 	c, err = t.StreamConnContext(ctx, c, metadata)
 	if err != nil {
-		return nil, fmt.Errorf("%s connect error: %w", t.addr, err)
+		return nil, err
 	}
 
 	pc := trojan.NewPacketConn(c)
 	return newPacketConn(pc, t), err
+}
+
+func (t *Trojan) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
+	cfg := t.option.XHttpOpts
+	if cfg == nil {
+		cfg = &xhttp.Config{}
+	} else {
+		cfg = cfg.Clone()
+	}
+	scheme := "https"
+	hostHeader := cfg.Host
+	if hostHeader == "" {
+		hostHeader = t.option.SNI
+		if hostHeader == "" {
+			if host, _, err := net.SplitHostPort(t.addr); err == nil {
+				hostHeader = host
+			} else {
+				hostHeader = t.addr
+			}
+		}
+	}
+	httpVersion := "2"
+	if len(t.option.ALPN) == 1 && t.option.ALPN[0] == "http/1.1" {
+		httpVersion = "1.1"
+	}
+	cfg.EnsureHTTP3TLS(hostHeader, t.option.SkipCertVerify, httpVersion)
+
+	clientFingerprint := t.option.ClientFingerprint
+	if cfg.ClientFingerprint != "" {
+		clientFingerprint = cfg.ClientFingerprint
+	}
+
+	dialFn := func(ctx context.Context, network string) (net.Conn, error) {
+		if network == "" {
+			network = "tcp"
+		}
+		conn, err := d.DialContext(ctx, network, t.addr)
+		if err != nil {
+			return nil, err
+		}
+		if network != "tcp" {
+			return conn, nil
+		}
+		alpn := t.option.ALPN
+		if len(alpn) == 0 {
+			alpn = trojan.DefaultALPN
+		}
+		if httpVersion == "2" {
+			alpn = []string{"h2"}
+		} else if len(alpn) == 0 || alpn[0] != "http/1.1" {
+			alpn = []string{"http/1.1"}
+		}
+		tlsCfg := &vmess.TLSConfig{
+			Host:              hostHeader,
+			SkipCertVerify:    t.option.SkipCertVerify,
+			FingerPrint:       t.option.Fingerprint,
+			Certificate:       t.option.Certificate,
+			PrivateKey:        t.option.PrivateKey,
+			ClientFingerprint: clientFingerprint,
+			ECH:               t.echConfig,
+			Reality:           t.realityConfig,
+			NextProtos:        alpn,
+		}
+		conn, err = vmess.StreamTLSConn(ctx, conn, tlsCfg)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return conn, nil
+	}
+	return xhttp.Dial(ctx, xhttp.Options{
+		Dial:         dialFn,
+		Config:       cfg,
+		Scheme:       scheme,
+		HostHeader:   hostHeader,
+		Address:      t.addr,
+		HTTPVersion:  httpVersion,
+		PreferStream: t.realityConfig != nil,
+		Tag:          fmt.Sprintf("trojan[%s]", t.Name()),
+	})
+}
+
+// SupportWithDialer implements C.ProxyAdapter
+func (t *Trojan) SupportWithDialer() C.NetWork {
+	return C.ALLNet
 }
 
 // SupportUOT implements C.ProxyAdapter
@@ -236,13 +352,10 @@ func (t *Trojan) ProxyInfo() C.ProxyInfo {
 
 // Close implements C.ProxyAdapter
 func (t *Trojan) Close() error {
-	var errs []error
-	if t.gunClient != nil {
-		if err := t.gunClient.Close(); err != nil {
-			errs = append(errs, err)
-		}
+	if t.gunTransport != nil {
+		return t.gunTransport.Close()
 	}
-	return errors.Join(errs...)
+	return nil
 }
 
 func NewTrojan(option TrojanOption) (*Trojan, error) {
@@ -253,18 +366,18 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
 	}
 
 	t := &Trojan{
-		Base: NewBase(BaseOption{
-			Name:         option.Name,
-			Addr:         addr,
-			Type:         C.Trojan,
-			ProviderName: option.ProviderName,
-			UDP:          option.UDP,
-			TFO:          option.TFO,
-			MPTCP:        option.MPTCP,
-			Interface:    option.Interface,
-			RoutingMark:  option.RoutingMark,
-			Prefer:       option.IPVersion,
-		}),
+		Base: &Base{
+			name:   option.Name,
+			addr:   addr,
+			tp:     C.Trojan,
+			pdName: option.ProviderName,
+			udp:    option.UDP,
+			tfo:    option.TFO,
+			mpTcp:  option.MPTCP,
+			iface:  option.Interface,
+			rmark:  option.RoutingMark,
+			prefer: option.IPVersion,
+		},
 		option:      &option,
 		hexPassword: trojan.Key(option.Password),
 	}
@@ -316,21 +429,13 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
 			Reality:           t.realityConfig,
 		}
 
-		gunConfig := &gun.Config{
-			ServiceName:  option.GrpcOpts.GrpcServiceName,
-			UserAgent:    option.GrpcOpts.GrpcUserAgent,
-			Host:         option.SNI,
-			PingInterval: option.GrpcOpts.PingInterval,
-		}
+		t.gunTransport = gun.NewHTTP2Client(dialFn, tlsConfig)
 
-		t.gunClient = gun.NewClient(
-			func() *gun.Transport {
-				return gun.NewTransport(dialFn, tlsConfig, gunConfig)
-			},
-			option.GrpcOpts.MaxConnections,
-			option.GrpcOpts.MinStreams,
-			option.GrpcOpts.MaxStreams,
-		)
+		t.gunConfig = &gun.Config{
+			ServiceName: option.GrpcOpts.GrpcServiceName,
+			UserAgent:   option.GrpcOpts.GrpcUserAgent,
+			Host:        option.SNI,
+		}
 	}
 
 	return t, nil

@@ -16,7 +16,6 @@ type TrustTunnelServer struct {
 	Network              []string          `yaml:"network" json:"network,omitempty"`
 	CongestionController string            `yaml:"congestion-controller" json:"congestion-controller,omitempty"`
 	CWND                 int               `yaml:"cwnd" json:"cwnd,omitempty"`
-	BBRProfile           string            `yaml:"bbr-profile" json:"bbr-profile,omitempty"`
 }
 
 func (t TrustTunnelServer) String() string {

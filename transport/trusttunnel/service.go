@@ -6,9 +6,6 @@ import (
 	"net"
 	"time"
 
-	"github.com/metacubex/mihomo/common/httputils"
-	N "github.com/metacubex/mihomo/common/net"
-
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/h2c"
 	"github.com/metacubex/quic-go/http3"
@@ -19,13 +16,13 @@ import (
 	E "github.com/metacubex/sing/common/exceptions"
 	"github.com/metacubex/sing/common/logger"
 	M "github.com/metacubex/sing/common/metadata"
-	"github.com/metacubex/sing/common/network"
+	N "github.com/metacubex/sing/common/network"
 	"github.com/metacubex/tls"
 )
 
 type Handler interface {
-	network.TCPConnectionHandler
-	network.UDPConnectionHandler
+	N.TCPConnectionHandler
+	N.UDPConnectionHandler
 }
 
 type ICMPHandler interface {
@@ -39,7 +36,6 @@ type ServiceOptions struct {
 	ICMPHandler           ICMPHandler
 	QUICCongestionControl string
 	QUICCwnd              int
-	QUICBBRProfile        string
 }
 
 type Service struct {
@@ -50,7 +46,6 @@ type Service struct {
 	icmpHandler           ICMPHandler
 	quicCongestionControl string
 	quicCwnd              int
-	quicBBRProfile        string
 	httpServer            *http.Server
 	h2Server              *http.Http2Server
 	h3Server              *http3.Server
@@ -67,7 +62,6 @@ func NewService(options ServiceOptions) *Service {
 		icmpHandler:           options.ICMPHandler,
 		quicCongestionControl: options.QUICCongestionControl,
 		quicCwnd:              options.QUICCwnd,
-		quicBBRProfile:        options.QUICBBRProfile,
 	}
 }
 
@@ -166,8 +160,8 @@ func (s *Service) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 				},
 			},
 		}
-		httputils.SetAddrFromRequest(&conn.NetAddr, request)
-		conn.setup(request.Body, nil)
+		conn.SetAddrFromRequest(request)
+		conn.setUp(request.Body, nil)
 		firstPacket := buf.NewPacket()
 		destination, err := conn.ReadPacket(firstPacket)
 		if err != nil {
@@ -203,8 +197,8 @@ func (s *Service) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 					created: make(chan struct{}),
 				},
 			}
-			httputils.SetAddrFromRequest(&conn.NetAddr, request)
-			conn.setup(request.Body, nil)
+			conn.SetAddrFromRequest(request)
+			conn.setUp(request.Body, nil)
 			s.icmpHandler.NewICMPConnection(ctx, conn)
 		}
 	case HealthCheckMagicAddress:
@@ -226,9 +220,9 @@ func (s *Service) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 				created: make(chan struct{}),
 			},
 		}
-		httputils.SetAddrFromRequest(&conn.NetAddr, request)
-		conn.setup(request.Body, nil)
-		_ = s.handler.NewConnection(ctx, N.NewDeadlineConn(conn), M.Metadata{
+		conn.SetAddrFromRequest(request)
+		conn.setUp(request.Body, nil)
+		_ = s.handler.NewConnection(ctx, conn, M.Metadata{
 			Protocol:    "trusttunnel",
 			Source:      M.ParseSocksaddr(request.RemoteAddr),
 			Destination: M.ParseSocksaddr(request.Host).Unwrap(),

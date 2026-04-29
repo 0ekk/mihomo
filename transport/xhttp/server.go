@@ -1,8 +1,8 @@
 package xhttp
 
 import (
-	"bytes"
-	"encoding/base64"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,518 +11,682 @@ import (
 	"sync"
 	"time"
 
-	"github.com/metacubex/mihomo/common/httputils"
-	N "github.com/metacubex/mihomo/common/net"
-
+	"github.com/gofrs/uuid/v5"
 	"github.com/metacubex/http"
-	"github.com/metacubex/http/h2c"
+	"github.com/metacubex/mihomo/adapter/inbound"
+	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/transport/socks5"
+	"github.com/metacubex/quic-go"
+	http3 "github.com/metacubex/quic-go/http3"
+	"github.com/metacubex/tls"
 )
 
-type ServerOption struct {
-	Config
-	ConnHandler func(net.Conn)
-	HttpHandler http.Handler
+type requestHandler struct {
+	config               *Config
+	sessions             sync.Map
+	tunnel               C.Tunnel
+	additions            []inbound.Addition
+	idleTimeout          time.Duration
+	connectedIdleTimeout time.Duration
 }
 
-type httpServerConn struct {
-	mu      sync.Mutex
-	w       http.ResponseWriter
-	flusher http.Flusher
-	reader  io.ReadCloser
-	closed  bool
-	done    chan struct{}
-	once    sync.Once
+func deriveConnectedIdleTimeout(idleTimeout time.Duration) time.Duration {
+	if idleTimeout <= 0 {
+		return DefaultConnectedSessionIdleTimeout
+	}
+	connectedTimeout := idleTimeout * 3
+	if connectedTimeout < DefaultConnectedSessionIdleTimeout {
+		connectedTimeout = DefaultConnectedSessionIdleTimeout
+	}
+	return connectedTimeout
 }
 
-func newHTTPServerConn(w http.ResponseWriter, r io.ReadCloser) *httpServerConn {
-	flusher, _ := w.(http.Flusher)
-	return &httpServerConn{
-		w:       w,
-		flusher: flusher,
-		reader:  r,
-		done:    make(chan struct{}),
+type streamUploadConn struct {
+	io.ReadCloser
+	writer http.ResponseWriter
+	done   chan struct{}
+	once   sync.Once
+}
+
+func newStreamUploadConn(body io.ReadCloser, writer http.ResponseWriter) *streamUploadConn {
+	return &streamUploadConn{
+		ReadCloser: body,
+		writer:     writer,
+		done:       make(chan struct{}),
 	}
 }
 
-func (c *httpServerConn) Read(b []byte) (int, error) {
-	return c.reader.Read(b)
+func (s *streamUploadConn) Close() error {
+	err := s.ReadCloser.Close()
+	s.once.Do(func() {
+		close(s.done)
+	})
+	return err
 }
 
-func (c *httpServerConn) Write(b []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (s *streamUploadConn) Wait() <-chan struct{} {
+	return s.done
+}
 
-	if c.closed {
-		return 0, io.ErrClosedPipe
-	}
-
-	n, err := c.w.Write(b)
-	if err == nil && c.flusher != nil {
-		c.flusher.Flush()
+func (s *streamUploadConn) Write(p []byte) (int, error) {
+	n, err := s.writer.Write(p)
+	if err == nil {
+		if f, ok := s.writer.(http.Flusher); ok {
+			f.Flush()
+		}
 	}
 	return n, err
 }
 
-func (c *httpServerConn) Close() error {
-	c.once.Do(func() {
-		c.mu.Lock()
-		c.closed = true
-		c.mu.Unlock()
-		close(c.done)
-	})
-	return c.reader.Close()
-}
-
-func (c *httpServerConn) Wait() <-chan struct{} {
-	return c.done
-}
-
-type httpSession struct {
-	uploadQueue *UploadQueue
-	connected   chan struct{}
-	once        sync.Once
-}
-
-func newHTTPSession(maxPackets int) *httpSession {
-	return &httpSession{
-		uploadQueue: NewUploadQueue(maxPackets),
-		connected:   make(chan struct{}),
-	}
-}
-
-func (s *httpSession) markConnected() {
-	s.once.Do(func() {
-		close(s.connected)
-	})
-}
-
-type requestHandler struct {
-	config      Config
-	connHandler func(net.Conn)
-	httpHandler http.Handler
-
-	xPaddingBytes        Range
-	scMaxEachPostBytes   Range
-	scStreamUpServerSecs Range
-	scMaxBufferedPosts   Range
-
-	mu       sync.Mutex
-	sessions map[string]*httpSession
-}
-
-func NewServerHandler(opt ServerOption) (http.Handler, error) {
-	xPaddingBytes, err := opt.Config.GetNormalizedXPaddingBytes()
-	if err != nil {
-		return nil, err
-	}
-	scMaxEachPostBytes, err := opt.Config.GetNormalizedScMaxEachPostBytes()
-	if err != nil {
-		return nil, err
-	}
-	scStreamUpServerSecs, err := opt.Config.GetNormalizedScStreamUpServerSecs()
-	if err != nil {
-		return nil, err
-	}
-	scMaxBufferedPosts, err := opt.Config.GetNormalizedScMaxBufferedPosts()
-	if err != nil {
-		return nil, err
-	}
-	// using h2c.NewHandler to ensure we can work in plain http2
-	// and some tls conn is not *tls.Conn (like *reality.Conn)
-	return h2c.NewHandler(&requestHandler{
-		config:               opt.Config,
-		connHandler:          opt.ConnHandler,
-		httpHandler:          opt.HttpHandler,
-		xPaddingBytes:        xPaddingBytes,
-		scMaxEachPostBytes:   scMaxEachPostBytes,
-		scStreamUpServerSecs: scStreamUpServerSecs,
-		scMaxBufferedPosts:   scMaxBufferedPosts,
-		sessions:             map[string]*httpSession{},
-	}, &http.Http2Server{
-		IdleTimeout: 30 * time.Second,
-	}), nil
-}
-
-func (h *requestHandler) upsertSession(sessionID string) *httpSession {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	s, ok := h.sessions[sessionID]
-	if ok {
-		return s
-	}
-
-	s = newHTTPSession(h.scMaxBufferedPosts.Max)
-	h.sessions[sessionID] = s
-
-	// Reap orphan sessions that never become fully connected (e.g. from probing).
-	// Matches Xray-core's 30-second reaper in upsertSession.
-	go func() {
-		timer := time.NewTimer(30 * time.Second)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-			h.deleteSession(sessionID)
-		case <-s.connected:
-		}
-	}()
-
-	return s
-}
-
-func (h *requestHandler) deleteSession(sessionID string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if s, ok := h.sessions[sessionID]; ok {
-		_ = s.uploadQueue.Close()
-		delete(h.sessions, sessionID)
-	}
-}
-
-func (h *requestHandler) getSession(sessionID string) *httpSession {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.sessions[sessionID]
-}
-
-func (h *requestHandler) normalizedMode() string {
-	if h.config.Mode == "" {
-		return "auto"
-	}
-	return h.config.Mode
-}
-
-func (h *requestHandler) allowStreamOne() bool {
-	switch h.normalizedMode() {
-	case "auto", "stream-one", "stream-up":
-		return true
-	default:
-		return false
-	}
-}
-
-func (h *requestHandler) allowSessionDownload() bool {
-	switch h.normalizedMode() {
-	case "auto", "stream-up", "packet-up":
-		return true
-	default:
-		return false
-	}
-}
-
-func (h *requestHandler) allowStreamUpUpload() bool {
-	switch h.normalizedMode() {
-	case "auto", "stream-up":
-		return true
-	default:
-		return false
-	}
-}
-
-func (h *requestHandler) allowPacketUpUpload() bool {
-	switch h.normalizedMode() {
-	case "auto", "packet-up":
-		return true
-	default:
-		return false
-	}
-}
-
 func (h *requestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	path := h.config.NormalizedPath()
-	if h.httpHandler != nil && !strings.HasPrefix(r.URL.Path, path) {
-		h.httpHandler.ServeHTTP(w, r)
+	h.writeResponseHeader(w)
+
+	if err := h.validateRequest(r); err != nil {
+		log.Debugln("xhttp: validation failed: %v", err)
+		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
 
-	if h.config.Host != "" && !equalHost(r.Host, h.config.Host) {
-		http.NotFound(w, r)
-		return
-	}
-
-	if !strings.HasPrefix(r.URL.Path, path) {
-		http.NotFound(w, r)
-		return
-	}
-
-	h.config.WriteResponseHeader(w, r.Method, r.Header)
-	length := h.xPaddingBytes.Rand()
-	config := XPaddingConfig{Length: length}
-
-	if h.config.XPaddingObfsMode {
-		config.Placement = XPaddingPlacement{
-			Placement: h.config.XPaddingPlacement,
-			Key:       h.config.XPaddingKey,
-			Header:    h.config.XPaddingHeader,
+	if r.Method == http.MethodGet {
+		sessionID, err := h.parseSessionID(r.URL.Path)
+		if err != nil {
+			log.Debugln("xhttp: invalid session ID: %v", err)
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
 		}
-		config.Method = PaddingMethod(h.config.XPaddingMethod)
+		h.handleDownload(w, r, sessionID)
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		if h.isBasePath(r.URL.Path) {
+			h.handleStreamOneUpload(w, r)
+			return
+		}
+
+		sessionID, err := h.parseSessionID(r.URL.Path)
+		if err != nil {
+			log.Debugln("xhttp: invalid session ID: %v", err)
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+		if seq, err := h.parseSeq(r.URL.Path); err == nil {
+			h.handlePacketUpload(w, r, sessionID, seq)
+		} else {
+			h.handleStreamUpload(w, r, sessionID, false)
+		}
+		return
+	}
+
+	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+}
+
+func (h *requestHandler) writeResponseHeader(w http.ResponseWriter) {
+	// CORS headers for browser dialer parity with Xray.
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "*")
+
+	h.config.ApplyXPaddingToHeader(w.Header(), h.config.buildResponseXPaddingConfig())
+}
+
+func (h *requestHandler) validateRequest(r *http.Request) error {
+	if h.config.Host != "" && r.Host != h.config.Host && r.Host != "" {
+		return fmt.Errorf("host mismatch: expected %s, got %s", h.config.Host, r.Host)
+	}
+
+	if !strings.HasPrefix(r.URL.Path, h.config.Path) {
+		return fmt.Errorf("path mismatch: expected prefix %s", h.config.Path)
+	}
+
+	paddingRange := h.config.XPaddingBytes.WithDefault(100, 1000)
+	padding, paddingPlacement := h.config.ExtractXPaddingFromRequest(r, h.config.XPaddingObfsMode)
+	if padding == "" {
+		return nil
+	}
+	if !h.config.IsPaddingValid(padding, paddingRange.From, paddingRange.To, PaddingMethod(h.config.XPaddingMethod)) {
+		return fmt.Errorf("invalid x_padding (%s) length: %d not in [%d, %d]", paddingPlacement, len(padding), paddingRange.From, paddingRange.To)
+	}
+
+	return nil
+}
+
+func isValidSessionID(id string) bool {
+	_, err := uuid.FromString(id)
+	return err == nil
+}
+
+func (h *requestHandler) parseSessionID(path string) (string, error) {
+	if !strings.HasPrefix(path, h.config.Path) {
+		return "", errors.New("invalid path prefix")
+	}
+
+	remainder := strings.TrimPrefix(path, h.config.Path)
+	parts := strings.Split(strings.Trim(remainder, "/"), "/")
+
+	if len(parts) < 1 || parts[0] == "" {
+		return "", errors.New("missing session ID")
+	}
+
+	sessionID := parts[0]
+	if !isValidSessionID(sessionID) {
+		return "", errors.New("invalid session ID format")
+	}
+
+	return sessionID, nil
+}
+
+func (h *requestHandler) parseSeq(path string) (uint64, error) {
+	remainder := strings.TrimPrefix(path, h.config.Path)
+	parts := strings.Split(strings.Trim(remainder, "/"), "/")
+
+	if len(parts) < 2 {
+		return 0, errors.New("missing sequence number")
+	}
+
+	seq, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid sequence number: %w", err)
+	}
+
+	return seq, nil
+}
+
+func (h *requestHandler) isBasePath(path string) bool {
+	trimmedPath := strings.TrimRight(path, "/")
+	trimmedBase := strings.TrimRight(h.config.Path, "/")
+	return trimmedPath == trimmedBase
+}
+
+func (h *requestHandler) getOrCreateSession(sessionId string) (*httpSession, error) {
+	if val, ok := h.sessions.Load(sessionId); ok {
+		session := val.(*httpSession)
+		session.setIdleTimeouts(h.idleTimeout, h.connectedIdleTimeout)
+		session.touch(h.idleTimeout)
+		return session, nil
+	}
+
+	maxPackets := DefaultMaxPackets
+	if !h.config.ScMaxBufferedPosts.IsZero() {
+		maxPackets = int(h.config.ScMaxBufferedPosts.Random())
+	}
+
+	session := newHTTPSession(sessionId, maxPackets)
+	session.setIdleTimeouts(h.idleTimeout, h.connectedIdleTimeout)
+	session.touch(h.idleTimeout)
+	actual, _ := h.sessions.LoadOrStore(sessionId, session)
+	loaded := actual.(*httpSession)
+	loaded.setIdleTimeouts(h.idleTimeout, h.connectedIdleTimeout)
+	loaded.touch(h.idleTimeout)
+	return loaded, nil
+}
+
+func (h *requestHandler) closeAndDeleteSession(sessionID string, session *httpSession) {
+	if session != nil {
+		session.close()
+	}
+	h.sessions.Delete(sessionID)
+}
+
+func (h *requestHandler) cleanupExpiredSessions(now time.Time) {
+	h.sessions.Range(func(key, value any) bool {
+		sessionID, ok := key.(string)
+		if !ok {
+			return true
+		}
+		session, ok := value.(*httpSession)
+		if !ok {
+			return true
+		}
+		if session.closed.Load() || session.isExpired(now) {
+			h.closeAndDeleteSession(sessionID, session)
+		}
+		return true
+	})
+}
+
+func (h *requestHandler) closeAllSessions() {
+	h.sessions.Range(func(key, value any) bool {
+		sessionID, ok := key.(string)
+		if !ok {
+			return true
+		}
+		session, ok := value.(*httpSession)
+		if !ok {
+			return true
+		}
+		h.closeAndDeleteSession(sessionID, session)
+		return true
+	})
+}
+
+func (h *requestHandler) runSessionJanitor(ctx context.Context) {
+	if h.idleTimeout <= 0 {
+		return
+	}
+
+	cleanupInterval := DefaultSessionCleanupInterval
+	if h.idleTimeout < cleanupInterval {
+		cleanupInterval = h.idleTimeout / 2
+		if cleanupInterval < time.Second {
+			cleanupInterval = time.Second
+		}
+	}
+
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			h.closeAllSessions()
+			return
+		case now := <-ticker.C:
+			h.cleanupExpiredSessions(now)
+		}
+	}
+}
+
+func (h *requestHandler) handleStreamOneUpload(w http.ResponseWriter, r *http.Request) {
+	h.applyResponseHeaders(w)
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	if h.tunnel == nil {
+		return
+	}
+
+	httpSC := newStreamUploadConn(r.Body, w)
+	defer httpSC.Close()
+
+	remoteAddr, _ := net.ResolveTCPAddr("tcp", r.RemoteAddr)
+	localAddr, _ := net.ResolveTCPAddr("tcp", r.Host)
+	if remoteAddr == nil {
+		remoteAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+	}
+	if localAddr == nil {
+		localAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+	}
+
+	conn := &splitConn{
+		reader: httpSC,
+		writer: httpSC,
+		remote: remoteAddr,
+		local:  localAddr,
+	}
+	defer conn.Close()
+
+	go h.tunnel.HandleTCPConn(inbound.NewSocket(socks5.ParseAddr("0.0.0.0:0"), conn, C.HTTPS, h.additions...))
+
+	select {
+	case <-r.Context().Done():
+	case <-httpSC.Wait():
+	}
+}
+
+func (h *requestHandler) applyResponseHeaders(w http.ResponseWriter) {
+	if !h.config.NoGRPCHeader {
+		w.Header().Set("Content-Type", "application/grpc")
+	} else if !h.config.NoSSEHeader {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
 	} else {
-		config.Placement = XPaddingPlacement{
-			Placement: PlacementHeader,
-			Header:    "X-Padding",
-		}
+		w.Header().Set("Content-Type", "application/octet-stream")
 	}
 
-	h.config.ApplyXPaddingToResponse(w, config)
+	for k, v := range h.config.Headers {
+		w.Header().Set(k, v)
+	}
+}
 
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
+func (h *requestHandler) handleDownload(w http.ResponseWriter, r *http.Request, sessionID string) {
+	session, err := h.getOrCreateSession(sessionID)
+	if err != nil {
+		log.Warnln("xhttp: failed to get session: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+	session.markFullyConnected()
+	session.touch(h.idleTimeout)
 
-	paddingValue, _ := h.config.ExtractXPaddingFromRequest(r, h.config.XPaddingObfsMode)
-	if !h.config.IsPaddingValid(paddingValue, h.xPaddingBytes.Min, h.xPaddingBytes.Max, PaddingMethod(h.config.XPaddingMethod)) {
-		http.Error(w, "invalid xpadding", http.StatusBadRequest)
-		return
-	}
-	sessionId, seqStr := h.config.ExtractMetaFromRequest(r, path)
-
-	var currentSession *httpSession
-	if sessionId != "" {
-		currentSession = h.upsertSession(sessionId)
+	h.applyResponseHeaders(w)
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
 	}
 
-	// stream-up upload: POST /path/{session}
-	if r.Method != http.MethodGet && sessionId != "" && seqStr == "" && h.allowStreamUpUpload() {
-		httpSC := newHTTPServerConn(w, r.Body)
-		err := currentSession.uploadQueue.Push(Packet{
-			Reader: httpSC,
-		})
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusConflict)
+	for {
+		select {
+		case data, ok := <-session.downloadQueue:
+			if !ok {
+				h.closeAndDeleteSession(sessionID, session)
+				return
+			}
+			session.touch(h.idleTimeout)
+			if _, writeErr := w.Write(data); writeErr != nil {
+				log.Debugln("xhttp: download write error: %v", writeErr)
+				h.closeAndDeleteSession(sessionID, session)
+				return
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+
+		case <-r.Context().Done():
+			log.Debugln("xhttp: client disconnected, closing session %s", sessionID)
+			h.closeAndDeleteSession(sessionID, session)
 			return
 		}
+	}
+}
 
-		// magic header instructs nginx + apache to not buffer response body
-		w.Header().Set("X-Accel-Buffering", "no")
-		// A web-compliant header telling all middleboxes to disable caching.
-		// Should be able to prevent overloading the cache, or stop CDNs from
-		// teeing the response stream into their cache, causing slowdowns.
-		w.Header().Set("Cache-Control", "no-store")
-		if !h.config.NoSSEHeader {
-			// magic header to make the HTTP middle box consider this as SSE to disable buffer
-			w.Header().Set("Content-Type", "text/event-stream")
-		}
-		w.WriteHeader(http.StatusOK)
+func (h *requestHandler) handleStreamUpload(w http.ResponseWriter, r *http.Request, sessionID string, closeWhenDone bool) {
+	session, err := h.getOrCreateSession(sessionID)
+	if err != nil {
+		log.Warnln("xhttp: failed to get session: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	if closeWhenDone {
+		defer h.closeAndDeleteSession(sessionID, session)
+	}
+	session.touch(h.idleTimeout)
 
-		rc := http.NewResponseController(w)
-		_ = rc.EnableFullDuplex() // http1 need to enable full duplex manually
-		_ = rc.Flush()            // force flush the response header
+	httpSC := newStreamUploadConn(r.Body, w)
+	defer httpSC.Close()
 
-		referrer := r.Header.Get("Referer")
-		if referrer != "" && h.scStreamUpServerSecs.Max > 0 {
-			go func() {
-				for {
-					_, err := httpSC.Write(bytes.Repeat([]byte{'X'}, int(h.xPaddingBytes.Rand())))
-					if err != nil {
-						break
+	packet := Packet{
+		Reader: httpSC,
+		Seq:    0,
+	}
+
+	if err := session.uploadQueue.Push(packet); err != nil {
+		log.Warnln("xhttp: failed to push stream packet: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	session.touch(h.idleTimeout)
+
+	remoteAddr, _ := net.ResolveTCPAddr("tcp", r.RemoteAddr)
+	localAddr, _ := net.ResolveTCPAddr("tcp", r.Host)
+	if remoteAddr == nil {
+		remoteAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+	}
+	if localAddr == nil {
+		localAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+	}
+
+	if h.tunnel != nil {
+		session.startTunnel(remoteAddr, localAddr, func(conn net.Conn) {
+			h.tunnel.HandleTCPConn(inbound.NewSocket(socks5.ParseAddr("0.0.0.0:0"), conn, C.HTTPS, h.additions...))
+		})
+	}
+
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+
+	// In tests or misconfiguration where no tunnel is attached, return immediately.
+	// Otherwise this handler can block forever waiting for stream closure signals.
+	if h.tunnel == nil {
+		return
+	}
+
+	if !closeWhenDone {
+		if referrer := r.Header.Get("Referer"); referrer != "" && !h.config.ScStreamUpServerSecs.IsZero() {
+			if secs := h.config.ScStreamUpServerSecs.Random(); secs > 0 {
+				go func(interval time.Duration) {
+					ticker := time.NewTicker(interval)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-httpSC.Wait():
+							return
+						case <-r.Context().Done():
+							return
+						case <-ticker.C:
+							_, writeErr := httpSC.Write([]byte{'X'})
+							if writeErr != nil {
+								return
+							}
+						}
 					}
-					time.Sleep(time.Duration(h.scStreamUpServerSecs.Rand()) * time.Second)
-				}
-			}()
+				}(time.Duration(secs) * time.Second)
+			}
 		}
+	}
 
-		select {
-		case <-r.Context().Done():
-		case <-httpSC.Wait():
-		}
+	select {
+	case <-r.Context().Done():
+	case <-httpSC.Wait():
+	}
+	session.touch(h.idleTimeout)
+}
 
-		_ = httpSC.Close()
+func (h *requestHandler) handlePacketUpload(w http.ResponseWriter, r *http.Request, sessionID string, seq uint64) {
+	session, err := h.getOrCreateSession(sessionID)
+	if err != nil {
+		log.Warnln("xhttp: failed to get session: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	session.touch(h.idleTimeout)
+
+	maxBytes := int(h.config.ScMaxEachPostBytes.Random())
+	if maxBytes <= 0 {
+		maxBytes = 1024 * 1024
+	}
+
+	payload := make([]byte, maxBytes)
+	n, err := io.ReadFull(r.Body, payload)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		log.Warnln("xhttp: failed to read packet: %v", err)
+		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
 
-	// packet-up upload: POST /path/{session}/{seq}
-	if r.Method != http.MethodGet && sessionId != "" && seqStr != "" && h.allowPacketUpUpload() {
-		scMaxEachPostBytes := h.scMaxEachPostBytes.Max
-		dataPlacement := h.config.GetNormalizedUplinkDataPlacement()
-		uplinkDataKey := h.config.UplinkDataKey
-		var headerPayload []byte
-		var err error
-		if dataPlacement == PlacementAuto || dataPlacement == PlacementHeader {
-			var headerPayloadChunks []string
-			for i := 0; true; i++ {
-				chunk := r.Header.Get(fmt.Sprintf("%s-%d", uplinkDataKey, i))
-				if chunk == "" {
-					break
-				}
-				headerPayloadChunks = append(headerPayloadChunks, chunk)
-			}
-			headerPayloadEncoded := strings.Join(headerPayloadChunks, "")
-			headerPayload, err = base64.RawURLEncoding.DecodeString(headerPayloadEncoded)
-			if err != nil {
-				http.Error(w, "invalid base64 in header's payload", http.StatusBadRequest)
-				return
-			}
-		}
+	packet := Packet{
+		Payload: payload[:n],
+		Seq:     seq,
+	}
 
-		var cookiePayload []byte
-		if dataPlacement == PlacementAuto || dataPlacement == PlacementCookie {
-			var cookiePayloadChunks []string
-			for i := 0; true; i++ {
-				cookieName := fmt.Sprintf("%s_%d", uplinkDataKey, i)
-				if c, _ := r.Cookie(cookieName); c != nil {
-					cookiePayloadChunks = append(cookiePayloadChunks, c.Value)
-				} else {
-					break
-				}
-			}
-			cookiePayloadEncoded := strings.Join(cookiePayloadChunks, "")
-			cookiePayload, err = base64.RawURLEncoding.DecodeString(cookiePayloadEncoded)
-			if err != nil {
-				http.Error(w, "invalid base64 in cookies' payload", http.StatusBadRequest)
-				return
-			}
-		}
+	if err := session.uploadQueue.Push(packet); err != nil {
+		log.Warnln("xhttp: failed to push packet: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	session.touch(h.idleTimeout)
 
-		var bodyPayload []byte
-		if dataPlacement == PlacementAuto || dataPlacement == PlacementBody {
-			if r.ContentLength > int64(scMaxEachPostBytes) {
-				http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
-				return
-			}
-			bodyPayload, err = io.ReadAll(io.LimitReader(r.Body, int64(scMaxEachPostBytes)+1))
-			if err != nil {
-				http.Error(w, "failed to read body", http.StatusBadRequest)
-				return
-			}
-		}
+	remoteAddr, _ := net.ResolveTCPAddr("tcp", r.RemoteAddr)
+	localAddr, _ := net.ResolveTCPAddr("tcp", r.Host)
+	if remoteAddr == nil {
+		remoteAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+	}
+	if localAddr == nil {
+		localAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+	}
 
-		var payload []byte
-		switch dataPlacement {
-		case PlacementHeader:
-			payload = headerPayload
-		case PlacementCookie:
-			payload = cookiePayload
-		case PlacementBody:
-			payload = bodyPayload
-		case PlacementAuto:
-			payload = headerPayload
-			payload = append(payload, cookiePayload...)
-			payload = append(payload, bodyPayload...)
-		}
-
-		if len(payload) > h.scMaxEachPostBytes.Max {
-			http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
-			return
-		}
-
-		seq, err := strconv.ParseUint(seqStr, 10, 64)
-		if err != nil {
-			http.Error(w, "invalid xhttp seq", http.StatusBadRequest)
-			return
-		}
-
-		err = currentSession.uploadQueue.Push(Packet{
-			Seq:     seq,
-			Payload: payload,
+	if h.tunnel != nil {
+		session.startTunnel(remoteAddr, localAddr, func(conn net.Conn) {
+			h.tunnel.HandleTCPConn(inbound.NewSocket(socks5.ParseAddr("0.0.0.0:0"), conn, C.HTTPS, h.additions...))
 		})
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func NewHTTP1Server(config *Config, tunnel C.Tunnel, additions []inbound.Addition) (*http.Server, error) {
+	if config == nil {
+		return nil, errors.New("xhttp: config is required")
+	}
+	handler := &requestHandler{
+		config:               config,
+		tunnel:               tunnel,
+		additions:            additions,
+		idleTimeout:          DefaultSessionIdleTimeout,
+		connectedIdleTimeout: deriveConnectedIdleTimeout(DefaultSessionIdleTimeout),
+	}
+	return &http.Server{
+		Handler: handler,
+	}, nil
+}
+
+func NewHTTP2Server(config *Config, tunnel C.Tunnel, additions []inbound.Addition, tlsCfg *tls.Config) (*http.Server, error) {
+	if config == nil {
+		return nil, errors.New("xhttp: config is required")
+	}
+	if tlsCfg == nil {
+		tlsCfg = &tls.Config{}
+	}
+	if len(tlsCfg.NextProtos) == 0 {
+		tlsCfg.NextProtos = []string{"h2", "http/1.1"}
+	}
+	handler := &requestHandler{
+		config:               config,
+		tunnel:               tunnel,
+		additions:            additions,
+		idleTimeout:          DefaultSessionIdleTimeout,
+		connectedIdleTimeout: deriveConnectedIdleTimeout(DefaultSessionIdleTimeout),
+	}
+	srv := &http.Server{
+		Handler:   handler,
+		TLSConfig: tlsCfg,
+	}
+	if err := http.Http2ConfigureServer(srv, &http.Http2Server{}); err != nil {
+		return nil, fmt.Errorf("xhttp: failed to configure HTTP/2: %w", err)
+	}
+	return srv, nil
+}
+
+func NewHTTP3Server(config *Config, tunnel C.Tunnel, additions []inbound.Addition, tlsCfg *tls.Config) (*http3.Server, error) {
+	if config == nil {
+		return nil, errors.New("xhttp: config is required")
+	}
+	if tlsCfg == nil {
+		tlsCfg = &tls.Config{
+			MinVersion: tls.VersionTLS13,
+		}
+	}
+	if tlsCfg.MinVersion < tls.VersionTLS13 {
+		tlsCfg.MinVersion = tls.VersionTLS13
+	}
+	if len(tlsCfg.NextProtos) == 0 {
+		tlsCfg.NextProtos = []string{"h3"}
+	}
+	handler := &requestHandler{
+		config:               config,
+		tunnel:               tunnel,
+		additions:            additions,
+		idleTimeout:          DefaultSessionIdleTimeout,
+		connectedIdleTimeout: deriveConnectedIdleTimeout(DefaultSessionIdleTimeout),
+	}
+	weakNetwork := config.H3WeakNetwork
+	quicCfg := &quic.Config{
+		InitialStreamReceiveWindow:     DefaultH3InitStreamReceiveWindow,
+		MaxStreamReceiveWindow:         DefaultH3MaxStreamReceiveWindow,
+		InitialConnectionReceiveWindow: DefaultH3InitConnReceiveWindow,
+		MaxConnectionReceiveWindow:     DefaultH3MaxConnReceiveWindow,
+		KeepAlivePeriod:                resolveH3KeepAlive(0, weakNetwork),
+		MaxIdleTimeout:                 resolveH3MaxIdleTimeout(0, weakNetwork),
+		DisablePathMTUDiscovery:        weakNetwork,
+		MaxIncomingStreams:             1024,
+	}
+	return &http3.Server{
+		Handler:         handler,
+		TLSConfig:       tlsCfg,
+		QUICConfig:      quicCfg,
+		Addr:            "",
+		EnableDatagrams: false,
+	}, nil
+}
+
+func NewServer(ctx context.Context, config *Config, tunnel C.Tunnel, additions []inbound.Addition, listener net.Listener, tlsCfg interface{}) error {
+	if config == nil {
+		return errors.New("xhttp: config is required")
+	}
+	if listener == nil {
+		return errors.New("xhttp: listener is required")
+	}
+
+	config.normalize()
+	httpVersion := config.httpVersion(tlsCfg != nil)
+	handler := &requestHandler{
+		config:               config,
+		tunnel:               tunnel,
+		additions:            additions,
+		idleTimeout:          DefaultSessionIdleTimeout,
+		connectedIdleTimeout: deriveConnectedIdleTimeout(DefaultSessionIdleTimeout),
+	}
+
+	switch httpVersion {
+	case "3":
+		utlsCfg, ok := tlsCfg.(*tls.Config)
+		if !ok && tlsCfg != nil {
+			return errors.New("xhttp: HTTP/3 requires *tls.Config")
+		}
+		srv, err := NewHTTP3Server(config, tunnel, additions, utlsCfg)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			return err
 		}
+		srv.Handler = handler
+		packetConn, ok := listener.(net.PacketConn)
+		if !ok {
+			return errors.New("xhttp: HTTP/3 requires PacketConn listener")
+		}
+		go func() {
+			if err := srv.Serve(packetConn); err != nil && err != http.ErrServerClosed {
+				log.Errorln("xhttp: HTTP/3 server error: %v", err)
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			srv.Close()
+		}()
+		go handler.runSessionJanitor(ctx)
+		return nil
 
-		if len(payload) == 0 {
-			// Methods without a body are usually cached by default.
-			w.Header().Set("Cache-Control", "no-store")
+	case "2":
+		tlsCfg2, ok := tlsCfg.(*tls.Config)
+		if !ok && tlsCfg != nil {
+			return errors.New("xhttp: HTTP/2 requires *tls.Config")
 		}
-		w.WriteHeader(http.StatusOK)
-		return
+		srv, err := NewHTTP2Server(config, tunnel, additions, tlsCfg2)
+		if err != nil {
+			return err
+		}
+		srv.Handler = handler
+		go func() {
+			if err := srv.ServeTLS(listener, "", ""); err != nil && err != http.ErrServerClosed {
+				log.Errorln("xhttp: HTTP/2 server error: %v", err)
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			srv.Close()
+		}()
+		go handler.runSessionJanitor(ctx)
+		return nil
+
+	default:
+		srv, err := NewHTTP1Server(config, tunnel, additions)
+		if err != nil {
+			return err
+		}
+		srv.Handler = handler
+		go func() {
+			if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+				log.Errorln("xhttp: HTTP/1.1 server error: %v", err)
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			srv.Close()
+		}()
+		go handler.runSessionJanitor(ctx)
+		return nil
 	}
-
-	// stream-up/packet-up download: GET /path/{session}
-	if r.Method == http.MethodGet && sessionId != "" && seqStr == "" && h.allowSessionDownload() {
-		currentSession.markConnected()
-
-		// magic header instructs nginx + apache to not buffer response body
-		w.Header().Set("X-Accel-Buffering", "no")
-		// A web-compliant header telling all middleboxes to disable caching.
-		// Should be able to prevent overloading the cache, or stop CDNs from
-		// teeing the response stream into their cache, causing slowdowns.
-		w.Header().Set("Cache-Control", "no-store")
-		if !h.config.NoSSEHeader {
-			// magic header to make the HTTP middle box consider this as SSE to disable buffer
-			w.Header().Set("Content-Type", "text/event-stream")
-		}
-		w.WriteHeader(http.StatusOK)
-
-		rc := http.NewResponseController(w)
-		_ = rc.EnableFullDuplex() // http1 need to enable full duplex manually
-		_ = rc.Flush()            // force flush the response header
-
-		httpSC := newHTTPServerConn(w, r.Body)
-		conn := &Conn{
-			writer: httpSC,
-			reader: currentSession.uploadQueue,
-			onClose: func() {
-				h.deleteSession(sessionId)
-			},
-		}
-		httputils.SetAddrFromRequest(&conn.NetAddr, r)
-
-		go h.connHandler(N.NewDeadlineConn(conn))
-
-		select {
-		case <-r.Context().Done():
-		case <-httpSC.Wait():
-		}
-
-		_ = conn.Close()
-		return
-	}
-
-	// stream-one: POST /path
-	if r.Method != http.MethodGet && sessionId == "" && seqStr == "" && h.allowStreamOne() {
-		w.Header().Set("X-Accel-Buffering", "no")
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(http.StatusOK)
-
-		rc := http.NewResponseController(w)
-		_ = rc.EnableFullDuplex() // http1 need to enable full duplex manually
-		_ = rc.Flush()            // force flush the response header
-
-		httpSC := newHTTPServerConn(w, r.Body)
-		conn := &Conn{
-			writer: httpSC,
-			reader: httpSC,
-		}
-		httputils.SetAddrFromRequest(&conn.NetAddr, r)
-
-		go h.connHandler(N.NewDeadlineConn(conn))
-
-		select {
-		case <-r.Context().Done():
-		case <-httpSC.Wait():
-		}
-
-		_ = conn.Close()
-		return
-	}
-
-	http.NotFound(w, r)
-}
-
-func splitNonEmpty(s string) []string {
-	raw := strings.Split(s, "/")
-	out := make([]string, 0, len(raw))
-	for _, v := range raw {
-		if v != "" {
-			out = append(out, v)
-		}
-	}
-	return out
-}
-
-func equalHost(a, b string) bool {
-	a = strings.ToLower(a)
-	b = strings.ToLower(b)
-
-	if ah, _, err := net.SplitHostPort(a); err == nil {
-		a = ah
-	}
-	if bh, _, err := net.SplitHostPort(b); err == nil {
-		b = bh
-	}
-
-	return a == b
 }

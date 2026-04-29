@@ -1,579 +1,334 @@
 package xhttp
 
 import (
-	"bytes"
-	"encoding/base64"
 	"fmt"
-	"io"
-	"math/rand"
-	"strconv"
+	"net/url"
+	"path"
 	"strings"
+	"time"
 
-	"github.com/metacubex/http"
+	"github.com/metacubex/tls"
 )
 
-const (
-	PlacementQueryInHeader = "queryInHeader"
-	PlacementCookie        = "cookie"
-	PlacementHeader        = "header"
-	PlacementQuery         = "query"
-	PlacementPath          = "path"
-	PlacementBody          = "body"
-	PlacementAuto          = "auto"
-)
-
+// Config holds SplitHTTP client settings.
 type Config struct {
-	Host                 string
-	Path                 string
-	Mode                 string
-	Headers              map[string]string
-	NoGRPCHeader         bool
-	XPaddingBytes        string
-	XPaddingObfsMode     bool
-	XPaddingKey          string
-	XPaddingHeader       string
-	XPaddingPlacement    string
-	XPaddingMethod       string
-	UplinkHTTPMethod     string
-	SessionPlacement     string
-	SessionKey           string
-	SeqPlacement         string
-	SeqKey               string
-	UplinkDataPlacement  string
-	UplinkDataKey        string
-	UplinkChunkSize      string
-	NoSSEHeader          bool   // server only
-	ScStreamUpServerSecs string // server only
-	ScMaxBufferedPosts   string // server only
-	ScMaxEachPostBytes   string
-	ScMinPostsIntervalMs string
-	ReuseConfig          *ReuseConfig
-	DownloadConfig       *Config
+	Host                   string            `proxy:"host,omitempty" json:"host"`
+	Path                   string            `proxy:"path,omitempty" json:"path"`
+	HTTPVersion            string            `proxy:"http-version,omitempty" json:"http-version"`
+	Mode                   string            `proxy:"mode,omitempty" json:"mode"`
+	H3CongestionController string            `proxy:"h3-congestion-controller,omitempty" json:"h3-congestion-controller"`
+	H3CWND                 int               `proxy:"h3-cwnd,omitempty" json:"h3-cwnd"`
+	H3WeakNetwork          bool              `proxy:"h3-weak-network,omitempty" json:"h3-weak-network"`
+	Headers                map[string]string `proxy:"headers,omitempty" json:"headers"`
+	NoGRPCHeader           bool              `proxy:"no-grpc-header,omitempty" json:"no-grpc-header"`
+	NoSSEHeader            bool              `proxy:"no-sse-header,omitempty" json:"no-sse-header"`
+	XPaddingBytes          Range             `proxy:"x-padding-bytes,omitempty" json:"x-padding-bytes"`
+	XPaddingObfsMode       bool              `proxy:"x-padding-obfs-mode,omitempty" json:"x-padding-obfs-mode"`
+	XPaddingKey            string            `proxy:"x-padding-key,omitempty" json:"x-padding-key"`
+	XPaddingHeader         string            `proxy:"x-padding-header,omitempty" json:"x-padding-header"`
+	XPaddingPlacement      string            `proxy:"x-padding-placement,omitempty" json:"x-padding-placement"`
+	XPaddingMethod         string            `proxy:"x-padding-method,omitempty" json:"x-padding-method"`
+	ScMaxEachPostBytes     Range             `proxy:"sc-max-each-post-bytes,omitempty" json:"sc-max-each-post-bytes"`
+	ScMinPostsIntervalMs   Range             `proxy:"sc-min-posts-interval-ms,omitempty" json:"sc-min-posts-interval-ms"`
+	ScMaxBufferedPosts     Range             `proxy:"sc-max-buffered-posts,omitempty" json:"sc-max-buffered-posts"`
+	ScStreamUpServerSecs   Range             `proxy:"sc-stream-up-server-secs,omitempty" json:"sc-stream-up-server-secs"`
+	Xmux                   *XmuxConfig       `proxy:"xmux,omitempty" json:"xmux"`
+	Download               *Config           `proxy:"download-settings,omitempty" json:"download-settings"`
+	ClientFingerprint      string            `proxy:"client-fingerprint,omitempty" json:"client-fingerprint"`
+
+	internalTLS *tls.Config `proxy:"-" json:"-"`
 }
 
-type ReuseConfig struct {
-	MaxConcurrency   string
-	MaxConnections   string
-	CMaxReuseTimes   string
-	HMaxRequestTimes string
-	HMaxReusableSecs string
-}
-
-func (c *Config) NormalizedMode() string {
-	if c.Mode == "" {
-		return "auto"
-	}
-	return c.Mode
-}
-
-func (c *Config) EffectiveMode(hasReality bool) string {
-	mode := c.NormalizedMode()
-	if mode != "auto" {
-		return mode
-	}
-	if hasReality {
-		if c.DownloadConfig != nil {
-			return "stream-up"
-		}
-		return "stream-one"
-	}
-	return "packet-up"
-}
-
-func (c *Config) NormalizedPath() string {
-	path := c.Path
-	if path == "" {
-		path = "/"
-	}
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
-	}
-	if !strings.HasSuffix(path, "/") {
-		path += "/"
-	}
-	return path
-}
-
-func (c *Config) GetRequestHeader() http.Header {
-	h := http.Header{}
-	for k, v := range c.Headers {
-		h.Set(k, v)
-	}
-	TryDefaultHeadersWith(h, "fetch")
-	return h
-}
-
-func (c *Config) GetRequestHeaderWithPayload(payload []byte, uplinkChunkSize Range) http.Header {
-	header := c.GetRequestHeader()
-
-	key := c.UplinkDataKey
-	encodedData := base64.RawURLEncoding.EncodeToString(payload)
-
-	for i := 0; len(encodedData) > 0; i++ {
-		chunkSize := uplinkChunkSize.Rand()
-		if len(encodedData) < chunkSize {
-			chunkSize = len(encodedData)
-		}
-		chunk := encodedData[:chunkSize]
-		encodedData = encodedData[chunkSize:]
-		headerKey := fmt.Sprintf("%s-%d", key, i)
-		header.Set(headerKey, chunk)
-	}
-
-	return header
-}
-
-func (c *Config) GetRequestCookiesWithPayload(payload []byte, uplinkChunkSize Range) []*http.Cookie {
-	cookies := []*http.Cookie{}
-
-	key := c.UplinkDataKey
-	encodedData := base64.RawURLEncoding.EncodeToString(payload)
-
-	for i := 0; len(encodedData) > 0; i++ {
-		chunkSize := uplinkChunkSize.Rand()
-		if len(encodedData) < chunkSize {
-			chunkSize = len(encodedData)
-		}
-		chunk := encodedData[:chunkSize]
-		encodedData = encodedData[chunkSize:]
-		cookieName := fmt.Sprintf("%s_%d", key, i)
-		cookies = append(cookies, &http.Cookie{Name: cookieName, Value: chunk})
-	}
-
-	return cookies
-}
-
-func (c *Config) WriteResponseHeader(writer http.ResponseWriter, requestMethod string, requestHeader http.Header) {
-	if origin := requestHeader.Get("Origin"); origin == "" {
-		writer.Header().Set("Access-Control-Allow-Origin", "*")
-	} else {
-		// Chrome says: The value of the 'Access-Control-Allow-Origin' header in the response must not be the wildcard '*' when the request's credentials mode is 'include'.
-		writer.Header().Set("Access-Control-Allow-Origin", origin)
-	}
-
-	if c.GetNormalizedSessionPlacement() == PlacementCookie ||
-		c.GetNormalizedSeqPlacement() == PlacementCookie ||
-		c.XPaddingPlacement == PlacementCookie ||
-		c.GetNormalizedUplinkDataPlacement() == PlacementCookie {
-		writer.Header().Set("Access-Control-Allow-Credentials", "true")
-	}
-
-	if requestMethod == "OPTIONS" {
-		requestedMethod := requestHeader.Get("Access-Control-Request-Method")
-		if requestedMethod != "" {
-			writer.Header().Set("Access-Control-Allow-Methods", requestedMethod)
-		} else {
-			writer.Header().Set("Access-Control-Allow-Methods", "*")
-		}
-
-		requestedHeaders := requestHeader.Get("Access-Control-Request-Headers")
-		if requestedHeaders == "" {
-			writer.Header().Set("Access-Control-Allow-Headers", "*")
-		} else {
-			writer.Header().Set("Access-Control-Allow-Headers", requestedHeaders)
-		}
-	}
-}
-
-func (c *Config) GetNormalizedUplinkHTTPMethod() string {
-	if c.UplinkHTTPMethod == "" {
-		return "POST"
-	}
-	return c.UplinkHTTPMethod
-}
-
-func (c *Config) GetNormalizedScStreamUpServerSecs() (Range, error) {
-	r, err := ParseRange(c.ScStreamUpServerSecs, "20-80")
-	if err != nil {
-		return Range{}, fmt.Errorf("invalid sc-stream-up-server-secs: %w", err)
-	}
-	return r, nil
-}
-
-func (c *Config) GetNormalizedScMaxBufferedPosts() (Range, error) {
-	r, err := ParseRange(c.ScMaxBufferedPosts, "30")
-	if err != nil {
-		return Range{}, fmt.Errorf("invalid sc-max-buffered-posts: %w", err)
-	}
-	if r.Max == 0 {
-		return Range{}, fmt.Errorf("invalid sc-max-buffered-posts: must be greater than zero")
-	}
-	return r, nil
-}
-
-func (c *Config) GetNormalizedScMaxEachPostBytes() (Range, error) {
-	r, err := ParseRange(c.ScMaxEachPostBytes, "1000000")
-	if err != nil {
-		return Range{}, fmt.Errorf("invalid sc-max-each-post-bytes: %w", err)
-	}
-	if r.Max == 0 {
-		return Range{}, fmt.Errorf("invalid sc-max-each-post-bytes: must be greater than zero")
-	}
-	return r, nil
-}
-
-func (c *Config) GetNormalizedScMinPostsIntervalMs() (Range, error) {
-	r, err := ParseRange(c.ScMinPostsIntervalMs, "30")
-	if err != nil {
-		return Range{}, fmt.Errorf("invalid sc-min-posts-interval-ms: %w", err)
-	}
-	if r.Max == 0 {
-		return Range{}, fmt.Errorf("invalid sc-min-posts-interval-ms: must be greater than zero")
-	}
-	return r, nil
-}
-
-func (c *Config) GetNormalizedUplinkChunkSize() (Range, error) {
-	uplinkChunkSize, err := ParseRange(c.UplinkChunkSize, "")
-	if err != nil {
-		return Range{}, fmt.Errorf("invalid uplink-chunk-size: %w", err)
-	}
-	if uplinkChunkSize.Max == 0 {
-		switch c.GetNormalizedUplinkDataPlacement() {
-		case PlacementCookie:
-			return Range{
-				Min: 2 * 1024, // 2 KiB
-				Max: 3 * 1024, // 3 KiB
-			}, nil
-		case PlacementHeader:
-			return Range{
-				Min: 3 * 1024, // 3 KiB
-				Max: 4 * 1024, // 4 KiB
-			}, nil
-		default:
-			return c.GetNormalizedScMaxEachPostBytes()
-		}
-	} else if uplinkChunkSize.Min < 64 {
-		uplinkChunkSize.Min = 64
-		if uplinkChunkSize.Max < 64 {
-			uplinkChunkSize.Max = 64
-		}
-	}
-	return uplinkChunkSize, nil
-}
-
-func (c *Config) GetNormalizedSessionPlacement() string {
-	if c.SessionPlacement == "" {
-		return PlacementPath
-	}
-	return c.SessionPlacement
-}
-
-func (c *Config) GetNormalizedSeqPlacement() string {
-	if c.SeqPlacement == "" {
-		return PlacementPath
-	}
-	return c.SeqPlacement
-}
-
-func (c *Config) GetNormalizedUplinkDataPlacement() string {
-	if c.UplinkDataPlacement == "" {
-		return PlacementBody
-	}
-	return c.UplinkDataPlacement
-}
-
-func (c *Config) GetNormalizedSessionKey() string {
-	if c.SessionKey != "" {
-		return c.SessionKey
-	}
-	switch c.GetNormalizedSessionPlacement() {
-	case PlacementHeader:
-		return "X-Session"
-	case PlacementCookie, PlacementQuery:
-		return "x_session"
-	default:
-		return ""
-	}
-}
-
-func (c *Config) GetNormalizedSeqKey() string {
-	if c.SeqKey != "" {
-		return c.SeqKey
-	}
-	switch c.GetNormalizedSeqPlacement() {
-	case PlacementHeader:
-		return "X-Seq"
-	case PlacementCookie, PlacementQuery:
-		return "x_seq"
-	default:
-		return ""
-	}
-}
-
-type Range struct {
-	Min int
-	Max int
-}
-
-func (r Range) Rand() int {
-	if r.Min == r.Max {
-		return r.Min
-	}
-	return r.Min + rand.Intn(r.Max-r.Min+1)
-}
-
-func ParseRange(s string, fallback string) (Range, error) {
-	if strings.TrimSpace(s) == "" {
-		return parseRange(fallback)
-	}
-	return parseRange(s)
-}
-
-func parseRange(s string) (Range, error) {
-	parts := strings.Split(strings.TrimSpace(s), "-")
-	if len(parts) == 1 {
-		v, err := strconv.Atoi(parts[0])
-		if err != nil {
-			return Range{}, err
-		}
-		return Range{v, v}, nil
-	}
-	if len(parts) != 2 {
-		return Range{}, fmt.Errorf("invalid range: %s", s)
-	}
-
-	minVal, err := strconv.Atoi(strings.TrimSpace(parts[0]))
-	if err != nil {
-		return Range{}, err
-	}
-	maxVal, err := strconv.Atoi(strings.TrimSpace(parts[1]))
-	if err != nil {
-		return Range{}, err
-	}
-	if minVal < 0 || maxVal < minVal {
-		return Range{}, fmt.Errorf("invalid range: %s", s)
-	}
-	return Range{minVal, maxVal}, nil
-}
-
-func (c *ReuseConfig) ResolveManagerConfig() (Range, Range, error) {
+func (c *Config) EnsureHTTP3TLS(fallbackHost string, skipVerify bool, httpVersion string) {
 	if c == nil {
-		return Range{}, Range{}, nil
+		return
 	}
-
-	maxConcurrency, err := ParseRange(c.MaxConcurrency, "0")
-	if err != nil {
-		return Range{}, Range{}, fmt.Errorf("invalid max-concurrency: %w", err)
+	if httpVersion == "3" {
+		host := c.Host
+		if host == "" {
+			host = fallbackHost
+		}
+		tlsCfg := &tls.Config{
+			ServerName:         host,
+			InsecureSkipVerify: skipVerify,
+			MinVersion:         tls.VersionTLS13,
+			NextProtos:         []string{"h3"},
+		}
+		c.internalTLS = tlsCfg
 	}
-
-	maxConnections, err := ParseRange(c.MaxConnections, "0")
-	if err != nil {
-		return Range{}, Range{}, fmt.Errorf("invalid max-connections: %w", err)
+	if c.Download != nil {
+		c.Download.EnsureHTTP3TLS(fallbackHost, skipVerify, httpVersion)
 	}
-
-	return maxConcurrency, maxConnections, nil
 }
 
-func (c *ReuseConfig) ResolveEntryConfig() (Range, Range, Range, error) {
+func (c *Config) clone() *Config {
 	if c == nil {
-		return Range{}, Range{}, Range{}, nil
+		return defaultConfig()
 	}
-
-	cMaxReuseTimes, err := ParseRange(c.CMaxReuseTimes, "0")
-	if err != nil {
-		return Range{}, Range{}, Range{}, fmt.Errorf("invalid c-max-reuse-times: %w", err)
-	}
-
-	hMaxRequestTimes, err := ParseRange(c.HMaxRequestTimes, "0")
-	if err != nil {
-		return Range{}, Range{}, Range{}, fmt.Errorf("invalid h-max-request-times: %w", err)
-	}
-
-	hMaxReusableSecs, err := ParseRange(c.HMaxReusableSecs, "0")
-	if err != nil {
-		return Range{}, Range{}, Range{}, fmt.Errorf("invalid h-max-reusable-secs: %w", err)
-	}
-
-	return cMaxReuseTimes, hMaxRequestTimes, hMaxReusableSecs, nil
-}
-
-func appendToPath(path, value string) string {
-	if strings.HasSuffix(path, "/") {
-		return path + value
-	}
-	return path + "/" + value
-}
-
-func (c *Config) ApplyMetaToRequest(req *http.Request, sessionId string, seqStr string) {
-	sessionPlacement := c.GetNormalizedSessionPlacement()
-	seqPlacement := c.GetNormalizedSeqPlacement()
-	sessionKey := c.GetNormalizedSessionKey()
-	seqKey := c.GetNormalizedSeqKey()
-
-	if sessionId != "" {
-		switch sessionPlacement {
-		case PlacementPath:
-			req.URL.Path = appendToPath(req.URL.Path, sessionId)
-		case PlacementQuery:
-			q := req.URL.Query()
-			q.Set(sessionKey, sessionId)
-			req.URL.RawQuery = q.Encode()
-		case PlacementHeader:
-			req.Header.Set(sessionKey, sessionId)
-		case PlacementCookie:
-			req.AddCookie(&http.Cookie{Name: sessionKey, Value: sessionId})
+	cp := *c
+	if len(c.Headers) != 0 {
+		cp.Headers = make(map[string]string, len(c.Headers))
+		for k, v := range c.Headers {
+			cp.Headers[k] = v
 		}
 	}
+	if c.Download != nil {
+		cp.Download = c.Download.clone()
+	}
+	if c.Xmux != nil {
+		cp.Xmux = c.Xmux.clone()
+	}
+	return &cp
+}
 
-	if seqStr != "" {
-		switch seqPlacement {
-		case PlacementPath:
-			req.URL.Path = appendToPath(req.URL.Path, seqStr)
-		case PlacementQuery:
-			q := req.URL.Query()
-			q.Set(seqKey, seqStr)
-			req.URL.RawQuery = q.Encode()
-		case PlacementHeader:
-			req.Header.Set(seqKey, seqStr)
-		case PlacementCookie:
-			req.AddCookie(&http.Cookie{Name: seqKey, Value: seqStr})
-		}
+func defaultConfig() *Config {
+	return &Config{
+		Path:                 "/",
+		XPaddingBytes:        Range{From: 100, To: 1000},
+		ScMaxEachPostBytes:   Range{From: 1_000_000, To: 1_000_000},
+		ScMinPostsIntervalMs: Range{From: 30, To: 30},
+		ScMaxBufferedPosts:   Range{From: 30, To: 30},
+		ScStreamUpServerSecs: Range{From: 20, To: 80},
 	}
 }
 
-func (c *Config) ExtractMetaFromRequest(req *http.Request, path string) (sessionId string, seqStr string) {
-	sessionPlacement := c.GetNormalizedSessionPlacement()
-	seqPlacement := c.GetNormalizedSeqPlacement()
-	sessionKey := c.GetNormalizedSessionKey()
-	seqKey := c.GetNormalizedSeqKey()
-
-	var subpath []string
-	pathPart := 0
-	if sessionPlacement == PlacementPath || seqPlacement == PlacementPath {
-		subpath = strings.Split(req.URL.Path[len(path):], "/")
+func (c *Config) normalize() {
+	if c == nil {
+		return
 	}
-
-	switch sessionPlacement {
-	case PlacementPath:
-		if len(subpath) > pathPart {
-			sessionId = subpath[pathPart]
-			pathPart += 1
-		}
-	case PlacementQuery:
-		sessionId = req.URL.Query().Get(sessionKey)
-	case PlacementHeader:
-		sessionId = req.Header.Get(sessionKey)
-	case PlacementCookie:
-		if cookie, e := req.Cookie(sessionKey); e == nil {
-			sessionId = cookie.Value
-		}
+	c.H3CongestionController = strings.ToLower(strings.TrimSpace(c.H3CongestionController))
+	switch c.H3CongestionController {
+	case "", "adaptive", "brutal", "bbr", "bbr_meta_v1", "bbr_meta_v2", "cubic", "new_reno":
+	default:
+		c.H3CongestionController = ""
 	}
-
-	switch seqPlacement {
-	case PlacementPath:
-		if len(subpath) > pathPart {
-			seqStr = subpath[pathPart]
-			pathPart += 1
-		}
-	case PlacementQuery:
-		seqStr = req.URL.Query().Get(seqKey)
-	case PlacementHeader:
-		seqStr = req.Header.Get(seqKey)
-	case PlacementCookie:
-		if cookie, e := req.Cookie(seqKey); e == nil {
-			seqStr = cookie.Value
-		}
+	if c.H3CWND < 0 {
+		c.H3CWND = 0
 	}
-
-	return sessionId, seqStr
+	c.Path = normalizePath(c.Path)
+	c.XPaddingBytes = c.XPaddingBytes.WithDefault(100, 1000)
+	c.ScMaxEachPostBytes = c.ScMaxEachPostBytes.WithDefault(1_000_000, 1_000_000)
+	c.ScMinPostsIntervalMs = c.ScMinPostsIntervalMs.WithDefault(30, 30)
+	c.ScMaxBufferedPosts = c.ScMaxBufferedPosts.WithDefault(30, 30)
+	c.ScStreamUpServerSecs = c.ScStreamUpServerSecs.WithDefault(20, 80)
+	c.normalizeXPadding()
+	switch c.Mode {
+	case "", "auto", "packet-up", "stream-up", "stream-one":
+	default:
+		c.Mode = "packet-up"
+	}
+	if c.Xmux == nil {
+		c.Xmux = &XmuxConfig{}
+	}
+	c.Xmux.normalize()
 }
 
-func (c *Config) FillStreamRequest(req *http.Request, sessionID string) error {
-	req.Header = c.GetRequestHeader()
-	xPaddingBytes, err := c.GetNormalizedXPaddingBytes()
+func (c *Config) normalizeXPadding() {
+	if c == nil || !c.XPaddingObfsMode {
+		return
+	}
+	if c.XPaddingKey == "" {
+		c.XPaddingKey = "x_padding"
+	}
+	if c.XPaddingHeader == "" {
+		c.XPaddingHeader = "Referer"
+	}
+	switch c.XPaddingPlacement {
+	case PlacementQueryInHeader, PlacementCookie, PlacementHeader, PlacementQuery:
+	default:
+		c.XPaddingPlacement = PlacementQueryInHeader
+	}
+	switch PaddingMethod(c.XPaddingMethod) {
+	case PaddingMethodRepeatX, PaddingMethodTokenish:
+	default:
+		c.XPaddingMethod = string(PaddingMethodRepeatX)
+	}
+}
+
+func normalizePath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	if !strings.HasSuffix(p, "/") {
+		p += "/"
+	}
+	return path.Clean(p) + "/"
+}
+
+func withPadding(rawURL string, padding int) string {
+	if padding <= 0 {
+		padding = 1
+	}
+	u, err := url.Parse(rawURL)
 	if err != nil {
-		return err
+		return rawURL
 	}
-	length := xPaddingBytes.Rand()
-	config := XPaddingConfig{Length: length}
+	query := u.Query()
+	query.Set("x_padding", strings.Repeat("X", padding))
+	u.RawQuery = query.Encode()
+	return u.String()
+}
 
-	if c.XPaddingObfsMode {
-		config.Placement = XPaddingPlacement{
-			Placement: c.XPaddingPlacement,
-			Key:       c.XPaddingKey,
-			Header:    c.XPaddingHeader,
-			RawURL:    req.URL.String(),
-		}
-		config.Method = PaddingMethod(c.XPaddingMethod)
-	} else {
-		config.Placement = XPaddingPlacement{
-			Placement: PlacementQueryInHeader,
-			Key:       "x_padding",
-			Header:    "Referer",
-			RawURL:    req.URL.String(),
-		}
+func (c *Config) validate() error {
+	if c == nil {
+		return fmt.Errorf("xhttp config is nil")
 	}
-
-	c.ApplyXPaddingToRequest(req, config)
-	c.ApplyMetaToRequest(req, sessionID, "")
-
-	if req.Body != nil && !c.NoGRPCHeader { // stream-up/one
-		req.Header.Set("Content-Type", "application/grpc")
+	if c.Host != "" && strings.Contains(c.Host, "://") {
+		return fmt.Errorf("xhttp host should not include scheme")
 	}
-
 	return nil
 }
 
-func (c *Config) FillDownloadRequest(req *http.Request, sessionID string) error {
-	return c.FillStreamRequest(req, sessionID)
+func (c *Config) internalTLSConfig() *tls.Config {
+	return c.internalTLS
 }
 
-func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqStr string, data []byte) error {
-	dataPlacement := c.GetNormalizedUplinkDataPlacement()
+// httpVersion resolves the HTTP version to use for server based on the
+// configured HTTPVersion and whether TLS is present.
+func (c *Config) httpVersion(hasTLS bool) string {
+	if c == nil {
+		if hasTLS {
+			return "2"
+		}
+		return "1.1"
+	}
+	v := strings.TrimSpace(strings.ToLower(c.HTTPVersion))
+	if v == "" || v == "auto" {
+		if hasTLS {
+			return "2"
+		}
+		return "1.1"
+	}
+	switch v {
+	case "3", "h3":
+		return "3"
+	case "2", "h2":
+		return "2"
+	default:
+		return "1.1"
+	}
+}
 
-	if dataPlacement == PlacementBody || dataPlacement == PlacementAuto {
-		request.Header = c.GetRequestHeader()
-		request.Body = io.NopCloser(bytes.NewReader(data))
-		request.ContentLength = int64(len(data))
-	} else {
-		request.Body = nil
-		request.ContentLength = 0
-		switch dataPlacement {
-		case PlacementHeader:
-			uplinkChunkSize, err := c.GetNormalizedUplinkChunkSize()
-			if err != nil {
-				return err
-			}
-			request.Header = c.GetRequestHeaderWithPayload(data, uplinkChunkSize)
-		case PlacementCookie:
-			request.Header = c.GetRequestHeader()
-			uplinkChunkSize, err := c.GetNormalizedUplinkChunkSize()
-			if err != nil {
-				return err
-			}
-			for _, cookie := range c.GetRequestCookiesWithPayload(data, uplinkChunkSize) {
-				request.AddCookie(cookie)
-			}
+func (c *Config) Clone() *Config {
+	return c.clone()
+}
+
+func (c *Config) normalizedXmux() normalizedXmux {
+	if c == nil || c.Xmux == nil {
+		return defaultXmux()
+	}
+	return c.Xmux.normalized()
+}
+
+func (c *Config) resolvedH3Congestion() (string, int) {
+	cc := DefaultH3CongestionController
+	cwnd := DefaultH3CongestionCWND
+	if c == nil {
+		return cc, cwnd
+	}
+	if c.H3CongestionController != "" {
+		cc = c.H3CongestionController
+	}
+	if c.H3CWND > 0 {
+		cwnd = c.H3CWND
+	}
+	return cc, cwnd
+}
+
+type XmuxConfig struct {
+	MaxConcurrency   Range `proxy:"max-concurrency,omitempty" json:"max-concurrency"`
+	MaxConnections   Range `proxy:"max-connections,omitempty" json:"max-connections"`
+	CMaxReuseTimes   Range `proxy:"c-max-reuse-times,omitempty" json:"c-max-reuse-times"`
+	HMaxRequestTimes Range `proxy:"h-max-request-times,omitempty" json:"h-max-request-times"`
+	HMaxReusableSecs Range `proxy:"h-max-reusable-secs,omitempty" json:"h-max-reusable-secs"`
+	HKeepAlivePeriod int64 `proxy:"h-keep-alive-period,omitempty" json:"h-keep-alive-period"`
+}
+
+func (x *XmuxConfig) clone() *XmuxConfig {
+	if x == nil {
+		return nil
+	}
+	cp := *x
+	return &cp
+}
+
+func (x *XmuxConfig) normalize() {
+	if x == nil {
+		return
+	}
+}
+
+type normalizedXmux struct {
+	maxConcurrency int32
+	maxConnections int
+	reuseRange     Range
+	requestRange   Range
+	reusableRange  Range
+	keepAlive      time.Duration
+}
+
+func defaultXmux() normalizedXmux {
+	return normalizedXmux{
+		maxConcurrency: 1,
+		maxConnections: 0,
+		reuseRange:     Range{},
+		requestRange:   Range{From: 600, To: 900},
+		reusableRange:  Range{From: 1800, To: 3000},
+		keepAlive:      30 * time.Second,
+	}
+}
+
+func (x *XmuxConfig) normalized() normalizedXmux {
+	if x == nil {
+		return defaultXmux()
+	}
+	n := defaultXmux()
+	if v := x.MaxConcurrency.WithDefault(n.maxConcurrency, n.maxConcurrency); v.To >= v.From {
+		n.maxConcurrency = v.Random()
+	}
+	if v := x.MaxConnections.WithDefault(0, 0); v.To >= v.From {
+		n.maxConnections = int(v.Random())
+	}
+	if !x.CMaxReuseTimes.IsZero() {
+		n.reuseRange = x.CMaxReuseTimes
+	}
+	if !x.HMaxRequestTimes.IsZero() {
+		n.requestRange = x.HMaxRequestTimes
+	}
+	if !x.HMaxReusableSecs.IsZero() {
+		n.reusableRange = x.HMaxReusableSecs
+	}
+	if x.HKeepAlivePeriod != 0 {
+		if x.HKeepAlivePeriod < 0 {
+			n.keepAlive = 0
+		} else {
+			n.keepAlive = time.Duration(x.HKeepAlivePeriod) * time.Second
 		}
 	}
+	return n
+}
 
-	xPaddingBytes, err := c.GetNormalizedXPaddingBytes()
-	if err != nil {
-		return err
+func (n normalizedXmux) newSlotLimits() (int32, int32, time.Time) {
+	var uses int32
+	if !n.reuseRange.IsZero() {
+		uses = n.reuseRange.Random()
 	}
-	length := xPaddingBytes.Rand()
-	config := XPaddingConfig{Length: length}
-
-	if c.XPaddingObfsMode {
-		config.Placement = XPaddingPlacement{
-			Placement: c.XPaddingPlacement,
-			Key:       c.XPaddingKey,
-			Header:    c.XPaddingHeader,
-			RawURL:    request.URL.String(),
-		}
-		config.Method = PaddingMethod(c.XPaddingMethod)
-	} else {
-		config.Placement = XPaddingPlacement{
-			Placement: PlacementQueryInHeader,
-			Key:       "x_padding",
-			Header:    "Referer",
-			RawURL:    request.URL.String(),
+	var requests int32
+	if !n.requestRange.IsZero() {
+		requests = n.requestRange.Random()
+		if requests <= 0 {
+			requests = 1
 		}
 	}
-
-	c.ApplyXPaddingToRequest(request, config)
-	c.ApplyMetaToRequest(request, sessionId, seqStr)
-
-	return nil
+	expiry := time.Time{}
+	if !n.reusableRange.IsZero() {
+		secs := n.reusableRange.Random()
+		if secs > 0 {
+			expiry = time.Now().Add(time.Duration(secs) * time.Second)
+		}
+	}
+	return uses, requests, expiry
 }

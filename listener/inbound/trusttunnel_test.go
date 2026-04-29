@@ -42,7 +42,6 @@ func testInboundTrustTunnel(t *testing.T, inboundOptions inbound.TrustTunnelOpti
 	outboundOptions.Port = int(addrPort.Port())
 	outboundOptions.UserName = "test"
 	outboundOptions.Password = userUUID
-	outboundOptions.DialerForAPI = tunnel.NewDialer()
 
 	out, err := outbound.NewTrustTunnel(outboundOptions)
 	if !assert.NoError(t, err) {

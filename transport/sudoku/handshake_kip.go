@@ -12,7 +12,7 @@ import (
 
 const kipHandshakeSkew = 60 * time.Second
 
-func kipHandshakeClient(rc *crypto.RecordConn, seed string, userHash [kipHelloUserHashSize]byte, feats uint32, tableHint uint32, hasTableHint bool) (uint32, error) {
+func kipHandshakeClient(rc *crypto.RecordConn, seed string, userHash [kipHelloUserHashSize]byte, feats uint32) (uint32, error) {
 	if rc == nil {
 		return 0, fmt.Errorf("nil conn")
 	}
@@ -31,7 +31,13 @@ func kipHandshakeClient(rc *crypto.RecordConn, seed string, userHash [kipHelloUs
 	var clientPub [kipHelloPubSize]byte
 	copy(clientPub[:], ephemeral.PublicKey().Bytes())
 
-	ch := newKIPClientHello(userHash, nonce, clientPub, feats, tableHint, hasTableHint)
+	ch := &KIPClientHello{
+		Timestamp: time.Now(),
+		UserHash:  userHash,
+		Nonce:     nonce,
+		ClientPub: clientPub,
+		Features:  feats,
+	}
 	if err := WriteKIPMessage(rc, KIPTypeClientHello, ch.EncodePayload()); err != nil {
 		return 0, fmt.Errorf("write client hello failed: %w", err)
 	}

@@ -2,33 +2,33 @@ package outbound
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
-	"time"
+	"strings"
 
 	"github.com/metacubex/mihomo/common/convert"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/ech"
+	"github.com/metacubex/mihomo/component/proxydialer"
 	tlsC "github.com/metacubex/mihomo/component/tls"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/gun"
-	"github.com/metacubex/mihomo/transport/tuic/common"
 	"github.com/metacubex/mihomo/transport/vless"
 	"github.com/metacubex/mihomo/transport/vless/encryption"
 	"github.com/metacubex/mihomo/transport/vmess"
 	"github.com/metacubex/mihomo/transport/xhttp"
 
 	"github.com/metacubex/http"
-	"github.com/metacubex/quic-go"
 	vmessSing "github.com/metacubex/sing-vmess"
 	"github.com/metacubex/sing-vmess/packetaddr"
 	M "github.com/metacubex/sing/common/metadata"
 	"github.com/metacubex/tls"
-	"github.com/samber/lo"
 )
 
 type Vless struct {
@@ -39,116 +39,44 @@ type Vless struct {
 	encryption *encryption.ClientInstance
 
 	// for gun mux
-	gunClient *gun.Client
-	// for xhttp
-	xhttpClient *xhttp.Client
+	gunConfig    *gun.Config
+	gunTransport *gun.TransportWrap
 
 	realityConfig *tlsC.RealityConfig
 	echConfig     *ech.Config
+	tlsFragment   *vmess.TLSFragmentConfig
 }
 
 type VlessOption struct {
 	BasicOption
-	Name              string            `proxy:"name"`
-	Server            string            `proxy:"server"`
-	Port              int               `proxy:"port"`
-	UUID              string            `proxy:"uuid"`
-	Flow              string            `proxy:"flow,omitempty"`
-	TLS               bool              `proxy:"tls,omitempty"`
-	ALPN              []string          `proxy:"alpn,omitempty"`
-	UDP               bool              `proxy:"udp,omitempty"`
-	PacketAddr        bool              `proxy:"packet-addr,omitempty"`
-	XUDP              bool              `proxy:"xudp,omitempty"`
-	PacketEncoding    string            `proxy:"packet-encoding,omitempty"`
-	Encryption        string            `proxy:"encryption,omitempty"`
-	Network           string            `proxy:"network,omitempty"`
-	ECHOpts           ECHOptions        `proxy:"ech-opts,omitempty"`
-	RealityOpts       RealityOptions    `proxy:"reality-opts,omitempty"`
-	HTTPOpts          HTTPOptions       `proxy:"http-opts,omitempty"`
-	HTTP2Opts         HTTP2Options      `proxy:"h2-opts,omitempty"`
-	GrpcOpts          GrpcOptions       `proxy:"grpc-opts,omitempty"`
-	WSOpts            WSOptions         `proxy:"ws-opts,omitempty"`
-	XHTTPOpts         XHTTPOptions      `proxy:"xhttp-opts,omitempty"`
-	WSHeaders         map[string]string `proxy:"ws-headers,omitempty"`
-	SkipCertVerify    bool              `proxy:"skip-cert-verify,omitempty"`
-	Fingerprint       string            `proxy:"fingerprint,omitempty"`
-	Certificate       string            `proxy:"certificate,omitempty"`
-	PrivateKey        string            `proxy:"private-key,omitempty"`
-	ServerName        string            `proxy:"servername,omitempty"`
-	ClientFingerprint string            `proxy:"client-fingerprint,omitempty"`
-}
-
-type XHTTPOptions struct {
-	Path                 string                 `proxy:"path,omitempty"`
-	Host                 string                 `proxy:"host,omitempty"`
-	Mode                 string                 `proxy:"mode,omitempty"`
-	Headers              map[string]string      `proxy:"headers,omitempty"`
-	NoGRPCHeader         bool                   `proxy:"no-grpc-header,omitempty"`
-	XPaddingBytes        string                 `proxy:"x-padding-bytes,omitempty"`
-	XPaddingObfsMode     bool                   `proxy:"x-padding-obfs-mode,omitempty"`
-	XPaddingKey          string                 `proxy:"x-padding-key,omitempty"`
-	XPaddingHeader       string                 `proxy:"x-padding-header,omitempty"`
-	XPaddingPlacement    string                 `proxy:"x-padding-placement,omitempty"`
-	XPaddingMethod       string                 `proxy:"x-padding-method,omitempty"`
-	UplinkHTTPMethod     string                 `proxy:"uplink-http-method,omitempty"`
-	SessionPlacement     string                 `proxy:"session-placement,omitempty"`
-	SessionKey           string                 `proxy:"session-key,omitempty"`
-	SeqPlacement         string                 `proxy:"seq-placement,omitempty"`
-	SeqKey               string                 `proxy:"seq-key,omitempty"`
-	UplinkDataPlacement  string                 `proxy:"uplink-data-placement,omitempty"`
-	UplinkDataKey        string                 `proxy:"uplink-data-key,omitempty"`
-	UplinkChunkSize      string                 `proxy:"uplink-chunk-size,omitempty"`
-	ScMaxEachPostBytes   string                 `proxy:"sc-max-each-post-bytes,omitempty"`
-	ScMinPostsIntervalMs string                 `proxy:"sc-min-posts-interval-ms,omitempty"`
-	ReuseSettings        *XHTTPReuseSettings    `proxy:"reuse-settings,omitempty"` // aka XMUX
-	DownloadSettings     *XHTTPDownloadSettings `proxy:"download-settings,omitempty"`
-}
-
-type XHTTPReuseSettings struct {
-	MaxConcurrency   string `proxy:"max-concurrency,omitempty"`
-	MaxConnections   string `proxy:"max-connections,omitempty"`
-	CMaxReuseTimes   string `proxy:"c-max-reuse-times,omitempty"`
-	HMaxRequestTimes string `proxy:"h-max-request-times,omitempty"`
-	HMaxReusableSecs string `proxy:"h-max-reusable-secs,omitempty"`
-	HKeepAlivePeriod int    `proxy:"h-keep-alive-period,omitempty"`
-}
-
-type XHTTPDownloadSettings struct {
-	// xhttp part
-	Path                 *string             `proxy:"path,omitempty"`
-	Host                 *string             `proxy:"host,omitempty"`
-	Headers              *map[string]string  `proxy:"headers,omitempty"`
-	NoGRPCHeader         *bool               `proxy:"no-grpc-header,omitempty"`
-	XPaddingBytes        *string             `proxy:"x-padding-bytes,omitempty"`
-	XPaddingObfsMode     *bool               `proxy:"x-padding-obfs-mode,omitempty"`
-	XPaddingKey          *string             `proxy:"x-padding-key,omitempty"`
-	XPaddingHeader       *string             `proxy:"x-padding-header,omitempty"`
-	XPaddingPlacement    *string             `proxy:"x-padding-placement,omitempty"`
-	XPaddingMethod       *string             `proxy:"x-padding-method,omitempty"`
-	UplinkHTTPMethod     *string             `proxy:"uplink-http-method,omitempty"`
-	SessionPlacement     *string             `proxy:"session-placement,omitempty"`
-	SessionKey           *string             `proxy:"session-key,omitempty"`
-	SeqPlacement         *string             `proxy:"seq-placement,omitempty"`
-	SeqKey               *string             `proxy:"seq-key,omitempty"`
-	UplinkDataPlacement  *string             `proxy:"uplink-data-placement,omitempty"`
-	UplinkDataKey        *string             `proxy:"uplink-data-key,omitempty"`
-	UplinkChunkSize      *string             `proxy:"uplink-chunk-size,omitempty"`
-	ScMaxEachPostBytes   *string             `proxy:"sc-max-each-post-bytes,omitempty"`
-	ScMinPostsIntervalMs *string             `proxy:"sc-min-posts-interval-ms,omitempty"`
-	ReuseSettings        *XHTTPReuseSettings `proxy:"reuse-settings,omitempty"` // aka XMUX
-	// proxy part
-	Server            *string         `proxy:"server,omitempty"`
-	Port              *int            `proxy:"port,omitempty"`
-	TLS               *bool           `proxy:"tls,omitempty"`
-	ALPN              *[]string       `proxy:"alpn,omitempty"`
-	ECHOpts           *ECHOptions     `proxy:"ech-opts,omitempty"`
-	RealityOpts       *RealityOptions `proxy:"reality-opts,omitempty"`
-	SkipCertVerify    *bool           `proxy:"skip-cert-verify,omitempty"`
-	Fingerprint       *string         `proxy:"fingerprint,omitempty"`
-	Certificate       *string         `proxy:"certificate,omitempty"`
-	PrivateKey        *string         `proxy:"private-key,omitempty"`
-	ServerName        *string         `proxy:"servername,omitempty"`
-	ClientFingerprint *string         `proxy:"client-fingerprint,omitempty"`
+	Name              string             `proxy:"name"`
+	Server            string             `proxy:"server"`
+	Port              int                `proxy:"port"`
+	UUID              string             `proxy:"uuid"`
+	Flow              string             `proxy:"flow,omitempty"`
+	TLS               bool               `proxy:"tls,omitempty"`
+	ALPN              []string           `proxy:"alpn,omitempty"`
+	UDP               bool               `proxy:"udp,omitempty"`
+	PacketAddr        bool               `proxy:"packet-addr,omitempty"`
+	XUDP              bool               `proxy:"xudp,omitempty"`
+	PacketEncoding    string             `proxy:"packet-encoding,omitempty"`
+	Encryption        string             `proxy:"encryption,omitempty"`
+	Network           string             `proxy:"network,omitempty"`
+	ECHOpts           ECHOptions         `proxy:"ech-opts,omitempty"`
+	RealityOpts       RealityOptions     `proxy:"reality-opts,omitempty"`
+	HTTPOpts          HTTPOptions        `proxy:"http-opts,omitempty"`
+	HTTP2Opts         HTTP2Options       `proxy:"h2-opts,omitempty"`
+	GrpcOpts          GrpcOptions        `proxy:"grpc-opts,omitempty"`
+	WSOpts            WSOptions          `proxy:"ws-opts,omitempty"`
+	XHttpOpts         *xhttp.Config      `proxy:"xhttp-opts,omitempty"`
+	WSHeaders         map[string]string  `proxy:"ws-headers,omitempty"`
+	SkipCertVerify    bool               `proxy:"skip-cert-verify,omitempty"`
+	Fingerprint       string             `proxy:"fingerprint,omitempty"`
+	Certificate       string             `proxy:"certificate,omitempty"`
+	PrivateKey        string             `proxy:"private-key,omitempty"`
+	ServerName        string             `proxy:"servername,omitempty"`
+	ClientFingerprint string             `proxy:"client-fingerprint,omitempty"`
+	TLSFragment       TLSFragmentOptions `proxy:"tls-fragment,omitempty"`
 }
 
 func (v *Vless) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.Metadata) (_ net.Conn, err error) {
@@ -177,6 +105,7 @@ func (v *Vless) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 			wsOpts.TLS = true
 			wsOpts.TLSConfig, err = ca.GetTLSConfig(ca.Option{
 				TLSConfig: &tls.Config{
+					MinVersion:         tls.VersionTLS12,
 					ServerName:         host,
 					InsecureSkipVerify: v.option.SkipCertVerify,
 					NextProtos:         []string{"http/1.1"},
@@ -230,9 +159,7 @@ func (v *Vless) StreamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 
 		c, err = vmess.StreamH2Conn(ctx, c, h2Opts)
 	case "grpc":
-		break // already handle in dialContext
-	case "xhttp":
-		break // already handle in dialContext
+		break // already handle in gun transport
 	default:
 		// default tcp network
 		// handle TLS
@@ -258,6 +185,17 @@ func (v *Vless) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 		}
 	}
 	if metadata.NetWork == C.UDP {
+		switch v.option.Flow {
+		case vless.XRV:
+			if metadata.DstPort == 443 {
+				if log.Level() == log.DEBUG {
+					err = fmt.Errorf("rejected UDP/443 traffic")
+					return
+				}
+			}
+		case vless.XRVU:
+
+		}
 		if v.option.PacketAddr {
 			metadata = &C.Metadata{
 				NetWork: C.UDP,
@@ -294,6 +232,7 @@ func (v *Vless) streamTLSConn(ctx context.Context, conn net.Conn, isH2 bool) (ne
 			ClientFingerprint: v.option.ClientFingerprint,
 			ECH:               v.echConfig,
 			Reality:           v.realityConfig,
+			TLSFragment:       v.tlsFragment,
 			NextProtos:        v.option.ALPN,
 		}
 
@@ -311,20 +250,38 @@ func (v *Vless) streamTLSConn(ctx context.Context, conn net.Conn, isH2 bool) (ne
 	return conn, nil
 }
 
-func (v *Vless) dialContext(ctx context.Context) (c net.Conn, err error) {
-	switch v.option.Network {
-	case "grpc": // gun transport
-		return v.gunClient.Dial()
-	case "xhttp":
-		return v.xhttpClient.Dial()
-	default:
-	}
-	return v.dialer.DialContext(ctx, "tcp", v.addr)
-}
-
 // DialContext implements C.ProxyAdapter
 func (v *Vless) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
-	c, err := v.dialContext(ctx)
+	return v.DialContextWithDialer(ctx, dialer.NewDialer(v.DialOptions()...), metadata)
+}
+
+// DialContextWithDialer implements C.ProxyAdapter
+func (v *Vless) DialContextWithDialer(ctx context.Context, dialer C.Dialer, metadata *C.Metadata) (_ C.Conn, err error) {
+	if len(v.option.DialerProxy) > 0 {
+		dialer = proxydialer.NewByName(v.option.DialerProxy)
+	}
+
+	var c net.Conn
+
+	if v.option.Network == "xhttp" {
+		c, err = v.dialXHTTP(ctx, dialer)
+		if err != nil {
+			return nil, err
+		}
+		defer func(c net.Conn) {
+			safeConnClose(c, err)
+		}(c)
+		c, err = v.streamConnContext(ctx, c, metadata)
+		if err != nil {
+			return nil, err
+		}
+		return NewConn(c, v), nil
+	} else if v.gunTransport != nil {
+		c, err = gun.StreamGunWithTransport(v.gunTransport, v.gunConfig)
+	} else {
+		c, err = dialer.DialContext(ctx, "tcp", v.addr)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
 	}
@@ -339,13 +296,181 @@ func (v *Vless) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn
 	return NewConn(c, v), err
 }
 
+func (v *Vless) dialXHTTP(ctx context.Context, d C.Dialer) (net.Conn, error) {
+	cfg := v.option.XHttpOpts
+	if cfg == nil {
+		cfg = &xhttp.Config{}
+	} else {
+		cfg = cfg.Clone()
+	}
+	scheme := "http"
+	if v.option.TLS || v.realityConfig != nil {
+		scheme = "https"
+	}
+	hostHeader := cfg.Host
+	if hostHeader == "" {
+		hostHeader = v.option.ServerName
+		if hostHeader == "" {
+			if host, _, err := net.SplitHostPort(v.addr); err == nil {
+				hostHeader = host
+			} else {
+				hostHeader = v.addr
+			}
+		}
+	}
+	httpVersion := "1.1"
+	configuredHTTPVersion := strings.TrimSpace(strings.ToLower(cfg.HTTPVersion))
+	if configuredHTTPVersion == "" || configuredHTTPVersion == "auto" {
+		if scheme == "https" {
+			httpVersion = "2"
+		}
+		if v.realityConfig == nil && len(v.option.ALPN) == 1 {
+			switch strings.TrimSpace(strings.ToLower(v.option.ALPN[0])) {
+			case "h3", "http/3":
+				httpVersion = "3"
+			case "http/1.1":
+				httpVersion = "1.1"
+			}
+		}
+	} else {
+		switch configuredHTTPVersion {
+		case "3", "h3":
+			if v.realityConfig == nil {
+				httpVersion = "3"
+			} else {
+				httpVersion = "2"
+			}
+		case "2", "h2":
+			httpVersion = "2"
+		default:
+			httpVersion = "1.1"
+		}
+	}
+	cfg.EnsureHTTP3TLS(hostHeader, v.option.SkipCertVerify, httpVersion)
+
+	clientFingerprint := v.option.ClientFingerprint
+	if cfg.ClientFingerprint != "" {
+		clientFingerprint = cfg.ClientFingerprint
+	}
+
+	dialFn := func(ctx context.Context, network string) (net.Conn, error) {
+		if d == nil {
+			return nil, fmt.Errorf("dial failed")
+		}
+		if network == "" {
+			network = "tcp"
+		}
+		if network == "udp" {
+			udpConn, err := d.DialContext(ctx, network, v.addr)
+			if err != nil {
+				return nil, err
+			}
+			if udpConn == nil {
+				return nil, fmt.Errorf("dial failed")
+			}
+			remoteAddr, ok := udpConn.RemoteAddr().(*net.UDPAddr)
+			_ = udpConn.Close()
+			if !ok {
+				return nil, fmt.Errorf("dial failed")
+			}
+			ip, ok := netip.AddrFromSlice(remoteAddr.IP)
+			if !ok {
+				return nil, fmt.Errorf("dial failed")
+			}
+			rAddrPort := netip.AddrPortFrom(ip.Unmap(), uint16(remoteAddr.Port))
+			packetConn, err := d.ListenPacket(ctx, "udp", "", rAddrPort)
+			if err != nil {
+				return nil, err
+			}
+			return N.NewBindPacketConn(packetConn, remoteAddr), nil
+		}
+
+		conn, err := d.DialContext(ctx, network, v.addr)
+		if err != nil {
+			return nil, err
+		}
+		if conn == nil {
+			return nil, fmt.Errorf("dial failed")
+		}
+		if network != "tcp" {
+			return conn, nil
+		}
+
+		if scheme == "https" || v.realityConfig != nil {
+			host, _, _ := net.SplitHostPort(v.addr)
+			tlsOpts := vmess.TLSConfig{
+				Host:              host,
+				SkipCertVerify:    v.option.SkipCertVerify,
+				FingerPrint:       v.option.Fingerprint,
+				Certificate:       v.option.Certificate,
+				PrivateKey:        v.option.PrivateKey,
+				ClientFingerprint: clientFingerprint,
+				ECH:               v.echConfig,
+				Reality:           v.realityConfig,
+				TLSFragment:       v.tlsFragment,
+				NextProtos:        v.option.ALPN,
+			}
+			if httpVersion == "2" {
+				tlsOpts.NextProtos = []string{"h2"}
+			}
+			if v.option.ServerName != "" {
+				tlsOpts.Host = v.option.ServerName
+			}
+			tlsConn, tlsErr := vmess.StreamTLSConn(ctx, conn, &tlsOpts)
+			if tlsErr != nil {
+				_ = conn.Close()
+				return nil, tlsErr
+			}
+			conn = tlsConn
+		}
+		return conn, nil
+	}
+	dialOpts := xhttp.Options{
+		Dial:         dialFn,
+		Config:       cfg,
+		Scheme:       scheme,
+		HostHeader:   hostHeader,
+		Address:      v.addr,
+		HTTPVersion:  httpVersion,
+		PreferStream: v.realityConfig != nil,
+		Tag:          fmt.Sprintf("vless[%s]", v.Name()),
+	}
+
+	conn, err := xhttp.Dial(ctx, dialOpts)
+	if err == nil {
+		return conn, nil
+	}
+	return nil, err
+}
+
 // ListenPacketContext implements C.ProxyAdapter
 func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
 	if err = v.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
+	var c net.Conn
 
-	c, err := v.dialContext(ctx)
+	d := v.dialer
+	if v.option.Network == "xhttp" {
+		c, err := v.dialXHTTP(ctx, d)
+		if err != nil {
+			return nil, err
+		}
+		defer func(c net.Conn) {
+			safeConnClose(c, err)
+		}(c)
+		c, err = v.streamConnContext(ctx, c, metadata)
+		if err != nil {
+			return nil, err
+		}
+		return v.ListenPacketOnStreamConn(ctx, c, metadata)
+	}
+
+	if v.gunTransport != nil {
+		c, err = gun.StreamGunWithTransport(v.gunTransport, v.gunConfig)
+	} else {
+		c, err = d.DialContext(ctx, "tcp", v.addr)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
 	}
@@ -355,7 +480,16 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 
 	c, err = v.StreamConnContext(ctx, c, metadata)
 	if err != nil {
-		return nil, fmt.Errorf("%s connect error: %s", v.addr, err.Error())
+		return nil, fmt.Errorf("new vless client error: %v", err)
+	}
+
+	return v.ListenPacketOnStreamConn(ctx, c, metadata)
+}
+
+// ListenPacketOnStreamConn implements C.ProxyAdapter
+func (v *Vless) ListenPacketOnStreamConn(ctx context.Context, c net.Conn, metadata *C.Metadata) (_ C.PacketConn, err error) {
+	if err = v.ResolveUDP(ctx, metadata); err != nil {
+		return nil, err
 	}
 
 	if v.option.XUDP {
@@ -391,18 +525,10 @@ func (v *Vless) ProxyInfo() C.ProxyInfo {
 
 // Close implements C.ProxyAdapter
 func (v *Vless) Close() error {
-	var errs []error
-	if v.gunClient != nil {
-		if err := v.gunClient.Close(); err != nil {
-			errs = append(errs, err)
-		}
+	if v.gunTransport != nil {
+		return v.gunTransport.Close()
 	}
-	if v.xhttpClient != nil {
-		if err := v.xhttpClient.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
+	return nil
 }
 
 func parseVlessAddr(metadata *C.Metadata, xudp bool) *vless.DstAddr {
@@ -435,13 +561,17 @@ func parseVlessAddr(metadata *C.Metadata, xudp bool) *vless.DstAddr {
 
 func NewVless(option VlessOption) (*Vless, error) {
 	var addons *vless.Addons
-	if len(option.Flow) >= 16 {
-		option.Flow = option.Flow[:16]
-		if option.Flow != vless.XRV {
+	option.Flow = strings.TrimSpace(option.Flow)
+	if option.Flow != "" {
+		switch option.Flow {
+		case vless.XRV, vless.XRVU:
+			flowOnWire := option.Flow
+			if flowOnWire == vless.XRVU {
+				flowOnWire = vless.XRV
+			}
+			addons = &vless.Addons{Flow: flowOnWire}
+		default:
 			return nil, fmt.Errorf("unsupported xtls flow type: %s", option.Flow)
-		}
-		addons = &vless.Addons{
-			Flow: option.Flow,
 		}
 	}
 
@@ -464,19 +594,19 @@ func NewVless(option VlessOption) (*Vless, error) {
 	}
 
 	v := &Vless{
-		Base: NewBase(BaseOption{
-			Name:         option.Name,
-			Addr:         net.JoinHostPort(option.Server, strconv.Itoa(option.Port)),
-			Type:         C.Vless,
-			ProviderName: option.ProviderName,
-			UDP:          option.UDP,
-			XUDP:         option.XUDP,
-			TFO:          option.TFO,
-			MPTCP:        option.MPTCP,
-			Interface:    option.Interface,
-			RoutingMark:  option.RoutingMark,
-			Prefer:       option.IPVersion,
-		}),
+		Base: &Base{
+			name:   option.Name,
+			addr:   net.JoinHostPort(option.Server, strconv.Itoa(option.Port)),
+			tp:     C.Vless,
+			pdName: option.ProviderName,
+			udp:    option.UDP,
+			xudp:   option.XUDP,
+			tfo:    option.TFO,
+			mpTcp:  option.MPTCP,
+			iface:  option.Interface,
+			rmark:  option.RoutingMark,
+			prefer: option.IPVersion,
+		},
 		client: client,
 		option: &option,
 	}
@@ -497,6 +627,11 @@ func NewVless(option VlessOption) (*Vless, error) {
 		return nil, err
 	}
 
+	v.tlsFragment, err = v.option.TLSFragment.Build()
+	if err != nil {
+		return nil, fmt.Errorf("invalid tls-fragment: %w", err)
+	}
+
 	switch option.Network {
 	case "h2":
 		if len(option.HTTP2Opts.Host) == 0 {
@@ -512,10 +647,9 @@ func NewVless(option VlessOption) (*Vless, error) {
 		}
 
 		gunConfig := &gun.Config{
-			ServiceName:  option.GrpcOpts.GrpcServiceName,
-			UserAgent:    option.GrpcOpts.GrpcUserAgent,
-			Host:         option.ServerName,
-			PingInterval: option.GrpcOpts.PingInterval,
+			ServiceName: option.GrpcOpts.GrpcServiceName,
+			UserAgent:   option.GrpcOpts.GrpcUserAgent,
+			Host:        option.ServerName,
 		}
 		if option.ServerName == "" {
 			gunConfig.Host = v.addr
@@ -529,6 +663,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 				Certificate:       option.Certificate,
 				PrivateKey:        option.PrivateKey,
 				ClientFingerprint: option.ClientFingerprint,
+				TLSFragment:       v.tlsFragment,
 				NextProtos:        []string{"h2"},
 				ECH:               v.echConfig,
 				Reality:           v.realityConfig,
@@ -539,269 +674,9 @@ func NewVless(option VlessOption) (*Vless, error) {
 			}
 		}
 
-		v.gunClient = gun.NewClient(
-			func() *gun.Transport {
-				return gun.NewTransport(dialFn, tlsConfig, gunConfig)
-			},
-			option.GrpcOpts.MaxConnections,
-			option.GrpcOpts.MinStreams,
-			option.GrpcOpts.MaxStreams,
-		)
-	case "xhttp":
-		requestHost := v.option.XHTTPOpts.Host
-		if requestHost == "" {
-			if v.option.ServerName != "" {
-				requestHost = v.option.ServerName
-			} else {
-				requestHost = v.option.Server
-			}
-		}
+		v.gunConfig = gunConfig
 
-		var hKeepAlivePeriod time.Duration
-
-		var reuseCfg *xhttp.ReuseConfig
-		if option.XHTTPOpts.ReuseSettings != nil {
-			reuseCfg = &xhttp.ReuseConfig{
-				MaxConcurrency:   option.XHTTPOpts.ReuseSettings.MaxConcurrency,
-				MaxConnections:   option.XHTTPOpts.ReuseSettings.MaxConnections,
-				CMaxReuseTimes:   option.XHTTPOpts.ReuseSettings.CMaxReuseTimes,
-				HMaxRequestTimes: option.XHTTPOpts.ReuseSettings.HMaxRequestTimes,
-				HMaxReusableSecs: option.XHTTPOpts.ReuseSettings.HMaxReusableSecs,
-			}
-			hKeepAlivePeriod = time.Duration(option.XHTTPOpts.ReuseSettings.HKeepAlivePeriod) * time.Second
-		}
-
-		cfg := &xhttp.Config{
-			Host:                 requestHost,
-			Path:                 v.option.XHTTPOpts.Path,
-			Mode:                 v.option.XHTTPOpts.Mode,
-			Headers:              v.option.XHTTPOpts.Headers,
-			NoGRPCHeader:         v.option.XHTTPOpts.NoGRPCHeader,
-			XPaddingBytes:        v.option.XHTTPOpts.XPaddingBytes,
-			XPaddingObfsMode:     v.option.XHTTPOpts.XPaddingObfsMode,
-			XPaddingKey:          v.option.XHTTPOpts.XPaddingKey,
-			XPaddingHeader:       v.option.XHTTPOpts.XPaddingHeader,
-			XPaddingPlacement:    v.option.XHTTPOpts.XPaddingPlacement,
-			XPaddingMethod:       v.option.XHTTPOpts.XPaddingMethod,
-			UplinkHTTPMethod:     v.option.XHTTPOpts.UplinkHTTPMethod,
-			SessionPlacement:     v.option.XHTTPOpts.SessionPlacement,
-			SessionKey:           v.option.XHTTPOpts.SessionKey,
-			SeqPlacement:         v.option.XHTTPOpts.SeqPlacement,
-			SeqKey:               v.option.XHTTPOpts.SeqKey,
-			UplinkDataPlacement:  v.option.XHTTPOpts.UplinkDataPlacement,
-			UplinkDataKey:        v.option.XHTTPOpts.UplinkDataKey,
-			UplinkChunkSize:      v.option.XHTTPOpts.UplinkChunkSize,
-			ScMaxEachPostBytes:   v.option.XHTTPOpts.ScMaxEachPostBytes,
-			ScMinPostsIntervalMs: v.option.XHTTPOpts.ScMinPostsIntervalMs,
-			ReuseConfig:          reuseCfg,
-		}
-
-		makeTransport := func() http.RoundTripper {
-			return xhttp.NewTransport(
-				func(ctx context.Context) (net.Conn, error) {
-					return v.dialer.DialContext(ctx, "tcp", v.addr)
-				},
-				func(ctx context.Context, raw net.Conn, isH2 bool) (net.Conn, error) {
-					return v.streamTLSConn(ctx, raw, isH2)
-				},
-				func(ctx context.Context, cfg *quic.Config) (*quic.Conn, error) {
-					host, _, _ := net.SplitHostPort(v.addr)
-					tlsOpts := &vmess.TLSConfig{
-						Host:              host,
-						SkipCertVerify:    v.option.SkipCertVerify,
-						FingerPrint:       v.option.Fingerprint,
-						Certificate:       v.option.Certificate,
-						PrivateKey:        v.option.PrivateKey,
-						ClientFingerprint: v.option.ClientFingerprint,
-						ECH:               v.echConfig,
-						Reality:           v.realityConfig,
-						NextProtos:        []string{"h3"},
-					}
-					if v.option.ServerName != "" {
-						tlsOpts.Host = v.option.ServerName
-					}
-					if !v.option.TLS {
-						return nil, errors.New("xhttp HTTP/3 requires TLS")
-					}
-					if v.realityConfig != nil {
-						return nil, errors.New("xhttp HTTP/3 does not support reality")
-					}
-					tlsConfig, err := tlsOpts.ToStdConfig()
-					if err != nil {
-						return nil, err
-					}
-
-					err = v.echConfig.ClientHandle(ctx, tlsConfig)
-					if err != nil {
-						return nil, err
-					}
-					_, quicConn, err := common.DialQuic(ctx, v.addr, v.DialOptions(), v.dialer, tlsConfig, cfg, true)
-					return quicConn, nil
-				},
-				v.option.ALPN,
-				hKeepAlivePeriod,
-			)
-		}
-		var makeDownloadTransport func() http.RoundTripper
-
-		if ds := v.option.XHTTPOpts.DownloadSettings; ds != nil {
-			if cfg.Mode == "stream-one" {
-				return nil, fmt.Errorf(`xhttp mode "stream-one" cannot be used with download-settings`)
-			}
-
-			downloadServer := lo.FromPtrOr(ds.Server, v.option.Server)
-			downloadPort := lo.FromPtrOr(ds.Port, v.option.Port)
-			downloadTLS := lo.FromPtrOr(ds.TLS, v.option.TLS)
-			downloadALPN := lo.FromPtrOr(ds.ALPN, v.option.ALPN)
-			downloadEchConfig := v.echConfig
-			if ds.ECHOpts != nil {
-				downloadEchConfig, err = ds.ECHOpts.Parse()
-				if err != nil {
-					return nil, err
-				}
-			}
-			downloadRealityCfg := v.realityConfig
-			if ds.RealityOpts != nil {
-				downloadRealityCfg, err = ds.RealityOpts.Parse()
-				if err != nil {
-					return nil, err
-				}
-			}
-			downloadSkipCertVerify := lo.FromPtrOr(ds.SkipCertVerify, v.option.SkipCertVerify)
-			downloadFingerprint := lo.FromPtrOr(ds.Fingerprint, v.option.Fingerprint)
-			downloadCertificate := lo.FromPtrOr(ds.Certificate, v.option.Certificate)
-			downloadPrivateKey := lo.FromPtrOr(ds.PrivateKey, v.option.PrivateKey)
-			downloadServerName := lo.FromPtrOr(ds.ServerName, v.option.ServerName)
-			downloadClientFingerprint := lo.FromPtrOr(ds.ClientFingerprint, v.option.ClientFingerprint)
-
-			downloadAddr := net.JoinHostPort(downloadServer, strconv.Itoa(downloadPort))
-
-			downloadHost := lo.FromPtrOr(ds.Host, v.option.XHTTPOpts.Host)
-			if downloadHost == "" {
-				if downloadServerName != "" {
-					downloadHost = downloadServerName
-				} else {
-					downloadHost = downloadServer
-				}
-			}
-
-			downloadHKeepAlivePeriod := hKeepAlivePeriod
-
-			downloadReuseCfg := reuseCfg
-			if ds.ReuseSettings != nil {
-				downloadReuseCfg = &xhttp.ReuseConfig{
-					MaxConcurrency:   ds.ReuseSettings.MaxConcurrency,
-					MaxConnections:   ds.ReuseSettings.MaxConnections,
-					CMaxReuseTimes:   ds.ReuseSettings.CMaxReuseTimes,
-					HMaxRequestTimes: ds.ReuseSettings.HMaxRequestTimes,
-					HMaxReusableSecs: ds.ReuseSettings.HMaxReusableSecs,
-				}
-				downloadHKeepAlivePeriod = time.Duration(ds.ReuseSettings.HKeepAlivePeriod) * time.Second
-			}
-
-			cfg.DownloadConfig = &xhttp.Config{
-				Host:                 downloadHost,
-				Path:                 lo.FromPtrOr(ds.Path, v.option.XHTTPOpts.Path),
-				Mode:                 v.option.XHTTPOpts.Mode,
-				Headers:              lo.FromPtrOr(ds.Headers, v.option.XHTTPOpts.Headers),
-				NoGRPCHeader:         lo.FromPtrOr(ds.NoGRPCHeader, v.option.XHTTPOpts.NoGRPCHeader),
-				XPaddingBytes:        lo.FromPtrOr(ds.XPaddingBytes, v.option.XHTTPOpts.XPaddingBytes),
-				XPaddingObfsMode:     lo.FromPtrOr(ds.XPaddingObfsMode, v.option.XHTTPOpts.XPaddingObfsMode),
-				XPaddingKey:          lo.FromPtrOr(ds.XPaddingKey, v.option.XHTTPOpts.XPaddingKey),
-				XPaddingHeader:       lo.FromPtrOr(ds.XPaddingHeader, v.option.XHTTPOpts.XPaddingHeader),
-				XPaddingPlacement:    lo.FromPtrOr(ds.XPaddingPlacement, v.option.XHTTPOpts.XPaddingPlacement),
-				XPaddingMethod:       lo.FromPtrOr(ds.XPaddingMethod, v.option.XHTTPOpts.XPaddingMethod),
-				UplinkHTTPMethod:     lo.FromPtrOr(ds.UplinkHTTPMethod, v.option.XHTTPOpts.UplinkHTTPMethod),
-				SessionPlacement:     lo.FromPtrOr(ds.SessionPlacement, v.option.XHTTPOpts.SessionPlacement),
-				SessionKey:           lo.FromPtrOr(ds.SessionKey, v.option.XHTTPOpts.SessionKey),
-				SeqPlacement:         lo.FromPtrOr(ds.SeqPlacement, v.option.XHTTPOpts.SeqPlacement),
-				SeqKey:               lo.FromPtrOr(ds.SeqKey, v.option.XHTTPOpts.SeqKey),
-				UplinkDataPlacement:  lo.FromPtrOr(ds.UplinkDataPlacement, v.option.XHTTPOpts.UplinkDataPlacement),
-				UplinkDataKey:        lo.FromPtrOr(ds.UplinkDataKey, v.option.XHTTPOpts.UplinkDataKey),
-				UplinkChunkSize:      lo.FromPtrOr(ds.UplinkChunkSize, v.option.XHTTPOpts.UplinkChunkSize),
-				ScMaxEachPostBytes:   lo.FromPtrOr(ds.ScMaxEachPostBytes, v.option.XHTTPOpts.ScMaxEachPostBytes),
-				ScMinPostsIntervalMs: lo.FromPtrOr(ds.ScMinPostsIntervalMs, v.option.XHTTPOpts.ScMinPostsIntervalMs),
-				ReuseConfig:          downloadReuseCfg,
-			}
-
-			makeDownloadTransport = func() http.RoundTripper {
-				return xhttp.NewTransport(
-					func(ctx context.Context) (net.Conn, error) {
-						return v.dialer.DialContext(ctx, "tcp", downloadAddr)
-					},
-					func(ctx context.Context, conn net.Conn, isH2 bool) (net.Conn, error) {
-						if downloadTLS {
-							host, _, _ := net.SplitHostPort(downloadAddr)
-
-							tlsOpts := vmess.TLSConfig{
-								Host:              host,
-								SkipCertVerify:    downloadSkipCertVerify,
-								FingerPrint:       downloadFingerprint,
-								Certificate:       downloadCertificate,
-								PrivateKey:        downloadPrivateKey,
-								ClientFingerprint: downloadClientFingerprint,
-								ECH:               downloadEchConfig,
-								Reality:           downloadRealityCfg,
-								NextProtos:        downloadALPN,
-							}
-
-							if isH2 {
-								tlsOpts.NextProtos = []string{"h2"}
-							}
-
-							if downloadServerName != "" {
-								tlsOpts.Host = downloadServerName
-							}
-
-							return vmess.StreamTLSConn(ctx, conn, &tlsOpts)
-						}
-
-						return conn, nil
-					},
-					func(ctx context.Context, cfg *quic.Config) (*quic.Conn, error) {
-						host, _, _ := net.SplitHostPort(downloadAddr)
-						tlsOpts := &vmess.TLSConfig{
-							Host:              host,
-							SkipCertVerify:    downloadSkipCertVerify,
-							FingerPrint:       downloadFingerprint,
-							Certificate:       downloadCertificate,
-							PrivateKey:        downloadPrivateKey,
-							ClientFingerprint: downloadClientFingerprint,
-							ECH:               downloadEchConfig,
-							Reality:           downloadRealityCfg,
-							NextProtos:        []string{"h3"},
-						}
-						if downloadServerName != "" {
-							tlsOpts.Host = downloadServerName
-						}
-						if !downloadTLS {
-							return nil, errors.New("xhttp HTTP/3 requires TLS")
-						}
-						if downloadRealityCfg != nil {
-							return nil, errors.New("xhttp HTTP/3 does not support reality")
-						}
-						tlsConfig, err := tlsOpts.ToStdConfig()
-						if err != nil {
-							return nil, err
-						}
-
-						err = downloadEchConfig.ClientHandle(ctx, tlsConfig)
-						if err != nil {
-							return nil, err
-						}
-						_, quicConn, err := common.DialQuic(ctx, downloadAddr, v.DialOptions(), v.dialer, tlsConfig, cfg, true)
-						return quicConn, nil
-					},
-					downloadALPN,
-					downloadHKeepAlivePeriod,
-				)
-			}
-		}
-
-		v.xhttpClient, err = xhttp.NewClient(cfg, makeTransport, makeDownloadTransport, v.realityConfig != nil)
-		if err != nil {
-			return nil, err
-		}
+		v.gunTransport = gun.NewHTTP2Client(dialFn, tlsConfig)
 	}
 
 	return v, nil

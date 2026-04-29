@@ -2,13 +2,19 @@ package xhttp
 
 import (
 	"crypto/rand"
-	"fmt"
 	"math"
 	"net/url"
 	"strings"
 
 	"github.com/metacubex/http"
 	"golang.org/x/net/http2/hpack"
+)
+
+const (
+	PlacementQueryInHeader = "queryInHeader"
+	PlacementCookie        = "cookie"
+	PlacementHeader        = "header"
+	PlacementQuery         = "query"
 )
 
 type PaddingMethod string
@@ -20,10 +26,9 @@ const (
 
 const charsetBase62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-// Huffman encoding gives ~20% size reduction for base62 sequences
 const avgHuffmanBytesPerCharBase62 = 0.8
 
-const validationTolerance = 2
+const paddingValidationTolerance = 2
 
 type XPaddingPlacement struct {
 	Placement string
@@ -76,7 +81,7 @@ func absInt(x int) int {
 	return x
 }
 
-func GenerateTokenishPaddingBase62(targetHuffmanBytes int) string {
+func generateTokenishPaddingBase62(targetHuffmanBytes int) string {
 	n := int(math.Ceil(float64(targetHuffmanBytes) / avgHuffmanBytesPerCharBase62))
 	if n < 1 {
 		n = 1
@@ -90,27 +95,22 @@ func GenerateTokenishPaddingBase62(targetHuffmanBytes int) string {
 	const maxIter = 150
 	adjustChar := byte('X')
 
-	// Adjust until close enough
 	for iter := 0; iter < maxIter; iter++ {
 		currentLength := int(hpack.HuffmanEncodeLength(randBase62Str))
 		diff := currentLength - targetHuffmanBytes
 
-		if absInt(diff) <= validationTolerance {
+		if absInt(diff) <= paddingValidationTolerance {
 			return randBase62Str
 		}
 
 		if diff < 0 {
-			// Too small -> append padding char(s)
 			randBase62Str += string(adjustChar)
-
-			// Avoid a long run of identical chars
 			if adjustChar == 'X' {
 				adjustChar = 'Z'
 			} else {
 				adjustChar = 'X'
 			}
 		} else {
-			// Too big -> remove from the end
 			if len(randBase62Str) <= 1 {
 				return randBase62Str
 			}
@@ -126,17 +126,11 @@ func GeneratePadding(method PaddingMethod, length int) string {
 		return ""
 	}
 
-	// https://www.rfc-editor.org/rfc/rfc7541.html#appendix-B
-	// h2's HPACK Header Compression feature employs a huffman encoding using a static table.
-	// 'X' and 'Z' are assigned an 8 bit code, so HPACK compression won't change actual padding length on the wire.
-	// https://www.rfc-editor.org/rfc/rfc9204.html#section-4.1.2-2
-	// h3's similar QPACK feature uses the same huffman table.
-
 	switch method {
 	case PaddingMethodRepeatX:
 		return strings.Repeat("X", length)
 	case PaddingMethodTokenish:
-		paddingValue := GenerateTokenishPaddingBase62(length)
+		paddingValue := generateTokenishPaddingBase62(length)
 		if paddingValue == "" {
 			return strings.Repeat("X", length)
 		}
@@ -146,7 +140,7 @@ func GeneratePadding(method PaddingMethod, length int) string {
 	}
 }
 
-func ApplyPaddingToCookie(req *http.Request, name, value string) {
+func applyPaddingToCookie(req *http.Request, name, value string) {
 	if req == nil || name == "" || value == "" {
 		return
 	}
@@ -157,18 +151,7 @@ func ApplyPaddingToCookie(req *http.Request, name, value string) {
 	})
 }
 
-func ApplyPaddingToResponseCookie(writer http.ResponseWriter, name, value string) {
-	if name == "" || value == "" {
-		return
-	}
-	http.SetCookie(writer, &http.Cookie{
-		Name:  name,
-		Value: value,
-		Path:  "/",
-	})
-}
-
-func ApplyPaddingToQuery(u *url.URL, key, value string) {
+func applyPaddingToQuery(u *url.URL, key, value string) {
 	if u == nil || key == "" || value == "" {
 		return
 	}
@@ -177,12 +160,49 @@ func ApplyPaddingToQuery(u *url.URL, key, value string) {
 	u.RawQuery = q.Encode()
 }
 
-func (c *Config) GetNormalizedXPaddingBytes() (Range, error) {
-	r, err := ParseRange(c.XPaddingBytes, "100-1000")
-	if err != nil {
-		return Range{}, fmt.Errorf("invalid x-padding-bytes: %w", err)
+func (c *Config) buildRequestXPaddingConfig(rawURL string) XPaddingConfig {
+	length := int(c.XPaddingBytes.WithDefault(100, 1000).Random())
+	config := XPaddingConfig{Length: length}
+
+	if c.XPaddingObfsMode {
+		config.Placement = XPaddingPlacement{
+			Placement: c.XPaddingPlacement,
+			Key:       c.XPaddingKey,
+			Header:    c.XPaddingHeader,
+			RawURL:    rawURL,
+		}
+		config.Method = PaddingMethod(c.XPaddingMethod)
+		return config
 	}
-	return r, nil
+
+	config.Placement = XPaddingPlacement{
+		Placement: PlacementQueryInHeader,
+		Key:       "x_padding",
+		Header:    "Referer",
+		RawURL:    rawURL,
+	}
+	return config
+}
+
+func (c *Config) buildResponseXPaddingConfig() XPaddingConfig {
+	length := int(c.XPaddingBytes.WithDefault(100, 1000).Random())
+	config := XPaddingConfig{Length: length}
+
+	if c.XPaddingObfsMode {
+		config.Placement = XPaddingPlacement{
+			Placement: c.XPaddingPlacement,
+			Key:       c.XPaddingKey,
+			Header:    c.XPaddingHeader,
+		}
+		config.Method = PaddingMethod(c.XPaddingMethod)
+		return config
+	}
+
+	config.Placement = XPaddingPlacement{
+		Placement: PlacementHeader,
+		Header:    "X-Padding",
+	}
+	return config
 }
 
 func (c *Config) ApplyXPaddingToHeader(h http.Header, config XPaddingConfig) {
@@ -214,7 +234,6 @@ func (c *Config) ApplyXPaddingToRequest(req *http.Request, config XPaddingConfig
 	}
 
 	placement := config.Placement.Placement
-
 	if placement == PlacementHeader || placement == PlacementQueryInHeader {
 		c.ApplyXPaddingToHeader(req.Header, config)
 		return
@@ -224,25 +243,9 @@ func (c *Config) ApplyXPaddingToRequest(req *http.Request, config XPaddingConfig
 
 	switch placement {
 	case PlacementCookie:
-		ApplyPaddingToCookie(req, config.Placement.Key, paddingValue)
+		applyPaddingToCookie(req, config.Placement.Key, paddingValue)
 	case PlacementQuery:
-		ApplyPaddingToQuery(req.URL, config.Placement.Key, paddingValue)
-	}
-}
-
-func (c *Config) ApplyXPaddingToResponse(writer http.ResponseWriter, config XPaddingConfig) {
-	placement := config.Placement.Placement
-
-	if placement == PlacementHeader || placement == PlacementQueryInHeader {
-		c.ApplyXPaddingToHeader(writer.Header(), config)
-		return
-	}
-
-	paddingValue := GeneratePadding(config.Method, config.Length)
-
-	switch placement {
-	case PlacementCookie:
-		ApplyPaddingToResponseCookie(writer, config.Placement.Key, paddingValue)
+		applyPaddingToQuery(req.URL, config.Placement.Key, paddingValue)
 	}
 }
 
@@ -253,7 +256,6 @@ func (c *Config) ExtractXPaddingFromRequest(req *http.Request, obfsMode bool) (s
 
 	if !obfsMode {
 		referrer := req.Header.Get("Referer")
-
 		if referrer != "" {
 			if referrerURL, err := url.Parse(referrer); err == nil {
 				paddingValue := referrerURL.Query().Get("x_padding")
@@ -278,7 +280,6 @@ func (c *Config) ExtractXPaddingFromRequest(req *http.Request, obfsMode bool) (s
 	}
 
 	headerValue := req.Header.Get(header)
-
 	if headerValue != "" {
 		if c.XPaddingPlacement == PlacementHeader {
 			paddingPlacement := PlacementHeader + "=" + header
@@ -287,13 +288,11 @@ func (c *Config) ExtractXPaddingFromRequest(req *http.Request, obfsMode bool) (s
 
 		if parsedURL, err := url.Parse(headerValue); err == nil {
 			paddingPlacement := PlacementQueryInHeader + "=" + header + ", key=" + key
-
 			return parsedURL.Query().Get(key), paddingPlacement
 		}
 	}
 
 	queryValue := req.URL.Query().Get(key)
-
 	if queryValue != "" {
 		paddingPlacement := PlacementQuery + ", key=" + key
 		return queryValue, paddingPlacement
@@ -302,24 +301,23 @@ func (c *Config) ExtractXPaddingFromRequest(req *http.Request, obfsMode bool) (s
 	return "", ""
 }
 
-func (c *Config) IsPaddingValid(paddingValue string, from, to int, method PaddingMethod) bool {
+func (c *Config) IsPaddingValid(paddingValue string, from, to int32, method PaddingMethod) bool {
 	if paddingValue == "" {
 		return false
 	}
 	if to <= 0 {
-		if r, err := c.GetNormalizedXPaddingBytes(); err == nil {
-			from, to = r.Min, r.Max
-		}
+		r := c.XPaddingBytes.WithDefault(100, 1000)
+		from, to = r.From, r.To
 	}
 
 	switch method {
 	case PaddingMethodRepeatX:
-		n := len(paddingValue)
+		n := int32(len(paddingValue))
 		return n >= from && n <= to
 	case PaddingMethodTokenish:
-		const tolerance = validationTolerance
+		const tolerance = int32(paddingValidationTolerance)
 
-		n := int(hpack.HuffmanEncodeLength(paddingValue))
+		n := int32(hpack.HuffmanEncodeLength(paddingValue))
 		f := from - tolerance
 		t := to + tolerance
 		if f < 0 {
@@ -327,7 +325,7 @@ func (c *Config) IsPaddingValid(paddingValue string, from, to int, method Paddin
 		}
 		return n >= f && n <= t
 	default:
-		n := len(paddingValue)
+		n := int32(len(paddingValue))
 		return n >= from && n <= to
 	}
 }

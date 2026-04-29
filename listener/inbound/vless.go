@@ -14,7 +14,6 @@ type VlessOption struct {
 	Users           []VlessUser   `inbound:"users"`
 	Decryption      string        `inbound:"decryption,omitempty"`
 	WsPath          string        `inbound:"ws-path,omitempty"`
-	XHTTPConfig     XHTTPConfig   `inbound:"xhttp-config,omitempty"`
 	GrpcServiceName string        `inbound:"grpc-service-name,omitempty"`
 	Certificate     string        `inbound:"certificate,omitempty"`
 	PrivateKey      string        `inbound:"private-key,omitempty"`
@@ -29,55 +28,6 @@ type VlessUser struct {
 	Username string `inbound:"username,omitempty"`
 	UUID     string `inbound:"uuid"`
 	Flow     string `inbound:"flow,omitempty"`
-}
-
-type XHTTPConfig struct {
-	Path                 string `inbound:"path,omitempty"`
-	Host                 string `inbound:"host,omitempty"`
-	Mode                 string `inbound:"mode,omitempty"`
-	XPaddingBytes        string `inbound:"x-padding-bytes,omitempty"`
-	XPaddingObfsMode     bool   `inbound:"x-padding-obfs-mode,omitempty"`
-	XPaddingKey          string `inbound:"x-padding-key,omitempty"`
-	XPaddingHeader       string `inbound:"x-padding-header,omitempty"`
-	XPaddingPlacement    string `inbound:"x-padding-placement,omitempty"`
-	XPaddingMethod       string `inbound:"x-padding-method,omitempty"`
-	UplinkHTTPMethod     string `inbound:"uplink-http-method,omitempty"`
-	SessionPlacement     string `inbound:"session-placement,omitempty"`
-	SessionKey           string `inbound:"session-key,omitempty"`
-	SeqPlacement         string `inbound:"seq-placement,omitempty"`
-	SeqKey               string `inbound:"seq-key,omitempty"`
-	UplinkDataPlacement  string `inbound:"uplink-data-placement,omitempty"`
-	UplinkDataKey        string `inbound:"uplink-data-key,omitempty"`
-	UplinkChunkSize      string `inbound:"uplink-chunk-size,omitempty"`
-	NoSSEHeader          bool   `inbound:"no-sse-header,omitempty"`
-	ScStreamUpServerSecs string `inbound:"sc-stream-up-server-secs,omitempty"`
-	ScMaxBufferedPosts   string `inbound:"sc-max-buffered-posts,omitempty"`
-	ScMaxEachPostBytes   string `inbound:"sc-max-each-post-bytes,omitempty"`
-}
-
-func (o XHTTPConfig) Build() LC.XHTTPConfig {
-	return LC.XHTTPConfig{
-		Path:                 o.Path,
-		Host:                 o.Host,
-		Mode:                 o.Mode,
-		NoSSEHeader:          o.NoSSEHeader,
-		XPaddingBytes:        o.XPaddingBytes,
-		XPaddingObfsMode:     o.XPaddingObfsMode,
-		XPaddingKey:          o.XPaddingKey,
-		XPaddingHeader:       o.XPaddingHeader,
-		XPaddingPlacement:    o.XPaddingPlacement,
-		UplinkHTTPMethod:     o.UplinkHTTPMethod,
-		SessionPlacement:     o.SessionPlacement,
-		SessionKey:           o.SessionKey,
-		SeqPlacement:         o.SeqPlacement,
-		SeqKey:               o.SeqKey,
-		UplinkDataPlacement:  o.UplinkDataPlacement,
-		UplinkDataKey:        o.UplinkDataKey,
-		UplinkChunkSize:      o.UplinkChunkSize,
-		ScStreamUpServerSecs: o.ScStreamUpServerSecs,
-		ScMaxBufferedPosts:   o.ScMaxBufferedPosts,
-		ScMaxEachPostBytes:   o.ScMaxEachPostBytes,
-	}
 }
 
 func (o VlessOption) Equal(config C.InboundConfig) bool {
@@ -113,7 +63,6 @@ func NewVless(options *VlessOption) (*Vless, error) {
 			Users:           users,
 			Decryption:      options.Decryption,
 			WsPath:          options.WsPath,
-			XHTTPConfig:     options.XHTTPConfig.Build(),
 			GrpcServiceName: options.GrpcServiceName,
 			Certificate:     options.Certificate,
 			PrivateKey:      options.PrivateKey,

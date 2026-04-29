@@ -20,7 +20,6 @@ type TrustTunnelOption struct {
 	Network              []string  `inbound:"network,omitempty"`
 	CongestionController string    `inbound:"congestion-controller,omitempty"`
 	CWND                 int       `inbound:"cwnd,omitempty"`
-	BBRProfile           string    `inbound:"bbr-profile,omitempty"`
 }
 
 func (o TrustTunnelOption) Equal(config C.InboundConfig) bool {
@@ -58,7 +57,6 @@ func NewTrustTunnel(options *TrustTunnelOption) (*TrustTunnel, error) {
 			Network:              options.Network,
 			CongestionController: options.CongestionController,
 			CWND:                 options.CWND,
-			BBRProfile:           options.BBRProfile,
 		},
 	}, nil
 }

@@ -10,11 +10,10 @@ import (
 	"net/netip"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/metacubex/mihomo/common/httputils"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/transport/gun"
 )
 
 const (
@@ -96,50 +95,35 @@ type httpConn struct {
 	writer    io.Writer
 	flusher   http.Flusher
 	body      io.ReadCloser
-	setupOnce sync.Once
 	created   chan struct{}
 	createErr error
-	cancelFn  func()
-	closeFn   func()
-	httputils.NetAddr
+	gun.NetAddr
 
 	// deadlines
 	deadline *time.Timer
 }
 
-func (h *httpConn) setup(body io.ReadCloser, err error) {
-	h.setupOnce.Do(func() {
-		h.body = body
-		h.createErr = err
-		close(h.created)
-	})
-	if h.createErr != nil && body != nil { // conn already closed before setup
-		_ = body.Close()
-	}
+func (h *httpConn) setUp(body io.ReadCloser, err error) {
+	h.body = body
+	h.createErr = err
+	close(h.created)
 }
 
 func (h *httpConn) waitCreated() error {
-	<-h.created
-	if h.body != nil {
-		return nil
+	if h.body != nil || h.createErr != nil {
+		return h.createErr
 	}
+	<-h.created
 	return h.createErr
 }
 
 func (h *httpConn) Close() error {
 	var errorArr []error
-	h.setup(nil, net.ErrClosed)
 	if closer, ok := h.writer.(io.Closer); ok {
 		errorArr = append(errorArr, closer.Close())
 	}
 	if h.body != nil {
 		errorArr = append(errorArr, h.body.Close())
-	}
-	if h.cancelFn != nil {
-		h.cancelFn()
-	}
-	if h.closeFn != nil {
-		h.closeFn()
 	}
 	return errors.Join(errorArr...)
 }

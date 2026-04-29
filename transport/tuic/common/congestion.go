@@ -1,6 +1,7 @@
 package common
 
 import (
+	hyCongestion "github.com/metacubex/mihomo/transport/hysteria/congestion"
 	"github.com/metacubex/mihomo/transport/tuic/congestion"
 	congestionv2 "github.com/metacubex/mihomo/transport/tuic/congestion_v2"
 
@@ -51,4 +52,12 @@ func SetCongestionController(quicConn *quic.Conn, cc string, cwnd int, profile s
 			),
 		)
 	}
+}
+
+func SetBrutalCongestionController(quicConn *quic.Conn, sendBPS uint64) bool {
+	if quicConn == nil || sendBPS == 0 {
+		return false
+	}
+	quicConn.SetCongestionControl(hyCongestion.NewBrutalSender(c.ByteCount(sendBPS)))
+	return true
 }

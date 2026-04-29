@@ -19,6 +19,7 @@ type TLSConfig struct {
 	Certificate       string
 	PrivateKey        string
 	ClientFingerprint string
+	TLSFragment       *TLSFragmentConfig
 	NextProtos        []string
 	ECH               *ech.Config
 	Reality           *tlsC.RealityConfig
@@ -38,6 +39,10 @@ func (cfg *TLSConfig) ToStdConfig() (*tls.Config, error) {
 }
 
 func StreamTLSConn(ctx context.Context, conn net.Conn, cfg *TLSConfig) (net.Conn, error) {
+	if cfg.TLSFragment != nil && cfg.Reality == nil {
+		conn = newTLSFragmentConn(conn, cfg.TLSFragment)
+	}
+
 	tlsConfig, err := cfg.ToStdConfig()
 	if err != nil {
 		return nil, err
